@@ -190,12 +190,12 @@ char const* kRepoReadme = R"MCPACKTEMPLATE(# Resource pack releases
 )MCPACKTEMPLATE";
 
 // 模板写入策略（按内容哈希，不依赖人工维护版本号）：
-//   .packrelay/templates.lock 记录「插件上次写进去的内容哈希」。
-//   - 文件不存在                -> 写入模板
-//   - 内容与模板一致            -> 什么都不做（不产生空 diff）
-//   - 文件哈希 == lock 里的哈希 -> 文件仍是插件写的，本次是模板升级 -> 备份后覆盖
-//   - 否则（哈希对不上/无 lock）-> 判定为本地改动 -> 保留并 warn
-//   - 无 lock 但文件已存在      -> 首次接管：备份后覆盖（保证 Actions 链路开箱可用）
+//   .packrelay/templates.lock 记录「插件上次写进去的内容哈希」，每行 `key=sha256`。
+//   - 文件不存在                  -> 写入模板
+//   - 内容与模板一致              -> 什么都不做（不产生空 diff）
+//   - 文件哈希 == lock 里的哈希   -> 文件仍是插件写的，本次是模板升级 -> 备份后覆盖
+//   - 有 lock 但哈希对不上        -> 判定为本地改动 -> 保留并 warn
+//   - 无 lock 但文件已存在        -> 首次接管：备份后覆盖（保证 Actions 链路开箱可用）
 char const* kLockRel      = ".packrelay/templates.lock";
 char const* kBackupDirRel = ".packrelay/backup";
 
@@ -233,7 +233,8 @@ TemplateLock readLock(fs::path const& p) {
         size_t end  = text.find('\n', pos);
         if (end == std::string::npos) end = text.size();
         auto line = text.substr(pos, end - pos);
-        auto eq   = line.find('=');
+        if (!line.empty() && line.back() == '\r') line.pop_back(); // 容忍 CRLF 编辑
+        auto eq = line.find('=');
         if (eq != std::string::npos && eq > 0) {
             lock.entries.emplace_back(line.substr(0, eq), line.substr(eq + 1));
         }
@@ -278,8 +279,9 @@ Result<bool> applyTemplate(
         return false; // 已是当前模板，零改动
     }
 
-    bool const knownTemplate = !lock.find(std::string(label)).empty();
-    bool const untouched     = lock.find(std::string(label)) == contentHash(existing);
+    std::string const recorded     = lock.find(std::string(label));
+    bool const        knownTemplate = !recorded.empty();
+    bool const        untouched     = recorded == contentHash(existing);
 
     if (knownTemplate && !untouched) {
         // 上次写入后文件被改过：视为用户自己的定制，绝不覆盖
