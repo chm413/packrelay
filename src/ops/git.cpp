@@ -148,7 +148,7 @@ Result<PublishResult> GitPublisher::commitAndPush(std::string const& message) {
 
     // 1) 暂存
     {
-        auto add = gitRun(fsu::toUtf8(mRepo), {"add", "-A"}, 60000);
+        auto add = gitRun(fsu::toUtf8(mRepo), {"add", "-A"}, 120000);
         if (!add) return add.error();
         if (add.value().exitCode != 0) return Error{ErrCode::Git, "git add failed", add.value().out};
     }

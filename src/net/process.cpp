@@ -94,6 +94,14 @@ ProcResult runProcess(std::string const& exe, ProcOptions const& opts) {
             return res;
         }
         SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0);
+    } else {
+        // 没有要喂给子进程的输入时，把它的 stdin 指到 NUL 设备。
+        // 不能继承父进程的 stdin：本进程（BDS）的控制台线程正在读同一个管道读端，
+        // 子进程再持有它，一来可能抢走本属于控制台的输入，二来实测会让 git 子进程
+        // 在启动阶段阻塞等待（内存不涨、无 index.lock、直到超时被杀）。
+        stdinRead = CreateFileW(L"NUL:", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                &sa, OPEN_EXISTING, 0, nullptr);
+        if (stdinRead == INVALID_HANDLE_VALUE) stdinRead = nullptr;
     }
 
     STARTUPINFOW si{};
@@ -244,6 +252,10 @@ Result<ProcResult> gitRun(
     opts.env["GIT_TERMINAL_PROMPT"] = "0";
     opts.env["GCM_INTERACTIVE"]     = "never";
     opts.env["GIT_PAGER"]           = "cat";
+    // 排查子进程启动期阻塞：trace 会打进被捕获的输出里
+    opts.env["GIT_TRACE"]              = "1";
+    opts.env["GIT_TRACE_PERFORMANCE"]  = "1";
+    opts.env["GIT_TRACE_SETUP"]        = "1";
 
     auto r = runProcess(gitExe, opts);
     if (r.timedOut) {
