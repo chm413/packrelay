@@ -252,10 +252,6 @@ Result<ProcResult> gitRun(
     opts.env["GIT_TERMINAL_PROMPT"] = "0";
     opts.env["GCM_INTERACTIVE"]     = "never";
     opts.env["GIT_PAGER"]           = "cat";
-    // 排查子进程启动期阻塞：trace 会打进被捕获的输出里
-    opts.env["GIT_TRACE"]              = "1";
-    opts.env["GIT_TRACE_PERFORMANCE"]  = "1";
-    opts.env["GIT_TRACE_SETUP"]        = "1";
 
     auto r = runProcess(gitExe, opts);
     if (r.timedOut) {
