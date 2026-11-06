@@ -88,7 +88,23 @@ jobs:
       - name: Configure
         run: |
           xmake --version
-          xmake f -c -y -m release --target_type=server
+          # 必须显式指定 msvc：runner 上 clang 也在 PATH 里，xmake 自动探测可能挑 clang，
+          # 而 LeviLamina 是 MSVC-only 的（源码用了 MSVC 扩展，导出也是 MSVC 修饰名），
+          # 用 clang 编译会在一开始就大量报错。
+          xmake f -c -y -m release --target_type=server --toolchain=msvc
+
+      - name: Dump xmake install logs
+        if: failure()
+        shell: bash
+        run: |
+          echo "--- looking for failed package logs ---"
+          root="${LOCALAPPDATA}/.xmake/cache/packages"
+          find "$root" -name 'install.txt' -path '*failed*' 2>/dev/null | while read -r f; do
+            echo "===== $f ====="
+            tail -150 "$f"
+          done
+          echo "--- xmake config ---"
+          xmake show 2>/dev/null | head -40 || true
 
       - name: Build mod
         run: xmake build -y -v packrelay
