@@ -361,9 +361,11 @@ packrelay cdn render --dir <服务器根>          # 按 cdn.json 重写 cdn_con
 
 两者共用 `src/core/gitauth.cpp`：`resolveGitToken` / `buildAuthArgs` / `probeGitRemote` / `applyGitField` / `patchConfigFileGit`。
 
-> **注意**：这些控制台指令依赖加载器提供 `bedrock_runtime.dll`（BDS 命令 API 的导入目标）。
-> 该模块缺失时插件会自动跳过命令注册并告警，其余功能不受影响 —— 详见 §12 第 5 条。
-> 上面这套 CLI 命令在任何环境下都可用，且用的是同一份配置文件。
+> **注意**：BDS 命令 API（`CommandOutput::success` / `CommandRegistry::parse`）的符号来自
+> `bedrock_runtime.dll`——它不是磁盘文件，而是 `prelink` 写入的假模块名，由 **SymbolProvider**
+> （`levilamina` 包的传递依赖）在 delay-load 时解析到 BDS 真实地址。这是**链接期**能力，
+> xmake 构建默认就具备，插件不做运行期探测；万一注册失败会 catch 住并 WARN，不影响其余功能。
+> CLI 命令在任何环境下都可用，且用的是同一份配置文件。
 
 ---
 
@@ -388,90 +390,67 @@ mcpack-sync/
 
 ## 9. 构建
 
+两条路径，职责不重叠：
+
+| 产物 | 构建系统 | 依赖 |
+|---|---|---|
+| `packrelay`（CLI）+ `mcpsync-tests`（单测） | **CMake** | 零第三方依赖，Windows / Linux 都能编 |
+| `packrelay.mod.dll`（LL 插件） | **xmake** | 需要 LL 整套包生态，见下 |
+
 ```bash
-# 依赖：CMake >= 3.20 + C++20 编译器（MSVC 2019+ / GCC 13+ / Clang 16+）
+# 引擎 + CLI + 单测
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/mcpsync-tests        # 单元测试
+cmake --build build --config Release -j
+ctest --test-dir build --output-on-failure -C Release
 ```
 
 本机实测工具链：**g++ 15.2.0 (MinGW-w64 UCRT, x86_64)**，CMake 4.2.1。
 
-LeviLamina mod 目标（`MCPSYNC_BUILD_MOD=ON`）**必须用 MSVC**：
-
-```bat
-cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64 ^
-      -DMCPSYNC_BUILD_MOD=ON -DLL_SDK_DIR=<LeviLamina SDK>
-cmake --build build-msvc --config Release
+```bash
+# mod（仅 Windows + MSVC）
+xmake f -c -y -m release --target_type=server --toolchain=msvc
+xmake build -y packrelay
+# 产物 build/windows/x64/release/packrelay.dll → 发布时重命名为 packrelay.mod.dll
 ```
 
-> 原因（已实测）：`LeviLamina.dll` 导出的是 MSVC 修饰名，例如
-> `?getModDir@Mod@mod@ll@@QEAAAEBVpath@filesystem@std@@XZ`。MinGW 的 Itanium ABI 无法解析，
-> 链接必然失败。这不是项目选择，是 LLBDS 生态的硬约束。
+> **为什么 mod 只能走 xmake**：它需要 LL 的整套包生态 —— bedrockdata 预编译头、
+> entt/gsl/glm/leveldb 等十几个依赖、`prelink.exe` + `bedrock_runtime_data`
+> （生成 `bedrock_runtime_api.lib`）、以及 `symbolprovider`（把 delay-load 的
+> `bedrock_runtime.dll` 解析到 BDS 真实地址）。这些由 levimc-repo 的 `levilamina`
+> 包一次性解析，还在 CMake 里手工拼不现实。
+>
+> 另外 `LeviLamina.dll` 导出的是 MSVC 修饰名（如
+> `?getModDir@Mod@mod@ll@@QEAAAEBVpath@filesystem@std@@XZ`），MinGW / clang 的 ABI
+> 无法解析，所以 mod 必须用 MSVC 工具链。
+>
+> CI 上另有一个坑：runner 的 PATH 里有 LLVM/clang，xmake 在**包安装阶段**会自己重新
+> 探测工具链（`--toolchain=msvc` 管不到这一层），结果用 clang-cl 配 MSVC 的 STL 头编译，
+> 炸在 `invalid application of 'sizeof' to an incomplete type`。解决办法是在 configure
+> 前把 clang 从 PATH 里剔除，见 `.github/workflows/build.yml`。
 
-### 9.1 不用 xmake 的 MSVC 直编链路（本机实测可用）
-
-LeviLamina 官方模板用 `xmake` + `@levibuildscript/linkrule`。在只装了 MSVC、没有完整
-xmake 包管理环境时（本机实测：xmake 拉第三方包全部 `LINK failed (exit code 1104)`），
-可以完全绕过 xmake，手工复刻 linkrule 做的事。整条链路只有 4 步：
-
-**① 编译所有 TU（`/MD /std:c++20`，注意必须 `/DLL_PLAT_S`）**
-
-```bat
-cl /nologo /c /std:c++20 /EHsc /MD /utf-8 /W3 /Zi /FS ^
-   /DLL_PLAT_S /DNOMINMAX /DUNICODE /D_WIN32_WINNT=0x0A00 ^
-   /Iinclude /I<LL>/src /I<LL>/src-server /I<3rd>/include ^
-   src\core\*.cpp src\net\*.cpp src\ops\*.cpp src\mod\*.cpp
-```
-
-**② prelink：从 `bedrock_runtime_data` 反查未定义符号，生成导入库**
-
-```
-prelink.exe server-windows-x64 <outdir> <bedrock_runtime_data> <obj1> <obj2> ...
-```
-
-参数顺序**必须**是 `prelink <target_type>-<plat>-<arch> <outdir> <data> <inputs...>`，
-且 `<outdir>/lib/` 必须**预先存在**，否则报 `Cannot create bedrock_runtime_api.lib`。
-
-**③ 链接**
-
-```bat
-cl /nologo /LD /MD <objs> /Fe:packrelay.dll /link /DLL /DEBUG /INCREMENTAL:NO ^
-   /LIBPATH:<outdir>\lib /LIBPATH:<LL>\lib ^
-   LeviLamina.lib bedrock_runtime_api.lib ^
-   /DELAYLOAD:bedrock_runtime.dll delayimp.lib ^
-   winhttp.lib ws2_32.lib user32.lib advapi32.lib shell32.lib ole32.lib crypt32.lib dbghelp.lib
-```
-
-**④ 必须有一个 TU 覆盖内存分配运算符**
-
-LeviLamina 加载 native mod 时会检查导出符号 `ll_memory_operator_overrided`，
-缺失就直接拒绝加载（"未使用统一的内存分配运算符"）。所以要有且只有一个 TU：
-
-```cpp
-// src/mod/memory_operators.cpp
-#define LL_MEMORY_OPERATORS
-#include "ll/api/memory/MemoryOperators.h"
-```
-
-本机踩过的额外坑，一并记在这里：
-
-| 现象 | 根因 | 处理 |
-|---|---|---|
-| `make_unexpected: 应输入 1 个参数，却提供了 2 个`（`ll/api/Expected.h:53`） | expected-lite v0.8.0 没有 `make_unexpected(in_place, ...)` 重载 | 升到 **v0.10.0** |
-| `fmt::v11::vformat` 未解析 | `Logger::log<T>` 模板会实例化非内联的 `vformat` | 额外编译 `fmt/src/format.cc` 与 `os.cc` |
-| `ServerInstance::queueForServerThread` 未解析 | 该 API 已标 `MCNAPI`（deprecated），BDS 1.26.60 的 runtime data 里无此符号 | 改用 `ll::thread::ServerThreadExecutor::getDefault().execute(...)` |
-| `CommandOutput::success` / `CommandRegistry::parse` 未解析 | 这些符号既不在 `LeviLamina.dll`，也不在 `bedrock_server.exe` | 由 prelink 的 `bedrock_runtime_api.lib` 提供 |
-| `vcvars64.bat` 跑完 `WindowsSDKVersion` 为空 → `rc.exe`/`mt.exe` NOTFOUND | 它内部调 `reg.exe`，被沙箱拦截 | 不用 vcvars，直接 export `INCLUDE`/`LIB`/`PATH` |
-| `D:\git\...` 被改写成 `D:\d\git\...`、`/nologo` 被当成路径 | MSYS2 参数转换 | `export MSYS2_ARG_CONV_EXCL='*'` |
-
-**`manifest.json` 的三个硬性约束**（写错就加载不上，且报错信息不直白）：
+**附：`manifest.json` 的三个硬约束**（写错就加载不上，且报错信息不直白）：
 
 | 字段 | 必须 | 写错的报错 |
 |---|---|---|
 | `type` | `"native"`（`NativeModManagerName`） | `无法识别的模组类型：mod` |
-| `entry` | 与实际 DLL 文件名完全一致 | 静默不加载 |
+| `entry` | 与实际 DLL 文件名完全一致（这里是 `packrelay.mod.dll`） | 静默不加载 |
 | `dependencies` | 若要写必须是数组 `[{"name":"LeviLamina","version":">=26.0.0"}]`；简化起见建议整段省略 | `field must be an array` / `dependency LeviLamina is missing` |
+
+### 9.1 为什么不提供第二条构建路径
+
+早期这里记录过一套「手工 MSVC 直编」流程（自己 `cl` 编全部 TU + 手调 `prelink` + 手动链接）。
+它在本机能跑通，但**是一条注定反复出错的路径**，已废弃：
+
+- 手写链接命令必然会漏掉 `SymbolProvider.lib`——而它才是把 delay-load 的
+  `bedrock_runtime.dll` 解析到 `bedrock_server_mod.exe` 真实地址的机制。漏了它，
+  命令 API 一调用就 `0xC06D007E` 把进程带走。
+- 反过来，自己定义 `__pfnDliNotifyHook2` 又会与 SymbolProvider 冲突（`LNK2005`），
+  把它顶掉后同样解析失败。两条路都会走到「命令永远不可用」。
+- 每次 LL 升级都要重新对齐 prelink 参数顺序、expected-lite 版本、fmt 非内联实现、
+  memory operators 这些细节。
+
+这些在 xmake + `levilamina` 包下全部自动完成（`symbolprovider v1.3.0` 是它的传递依赖）。
+所以**不要再加第二条构建路径**——真想离线构建，就装一次 xmake 并让它把包缓存下来。
 
 ### 9.2 CI：编译 / 打包 / 发布
 
@@ -698,14 +677,23 @@ Quit correctly                      ← exit code 0，无崩溃、无 minidump
    若哪天成员被收回私有，可退回"拼地址 + 写 `cdn_config.json` + 重启生效"的纯文件路线。
 4. **`mPackCDNUrls` 的主键格式仍未确认**：我们同时写 `<uuid>_<version>` 与裸 `<uuid>` 两种键；
    键不匹配时不会崩溃，只是该包会退回服务端直传。用 `/relay dump` 可看到 BDS 实际持有的键。
-5. **控制台指令依赖加载器提供 `bedrock_runtime.dll`**（本机环境缺失，已自动降级）。
-   命令 API（`CommandOutput::success` / `CommandRegistry::parse` / `Bedrock::type_id`）的导入全部
-   由 `prelink` 生成的 `bedrock_runtime_api.lib` 指向 `bedrock_runtime.dll`，而该模块由加载器在运行时
-   以虚拟模块形式提供，**不是磁盘文件**（官方 LeviLamina 发布 zip 里只有 `LeviLamina.dll/pdb/manifest.json`）。
-   本机 `PreLoader.dll` 未暴露它，探测结果恒为 `err=126 ERROR_MOD_NOT_FOUND`，一旦调用就
-   `0xC06D007E` 把进程带走。因此插件在 `ServerReady` 时探测一次，缺失就整段跳过命令注册并明确告警；
-   **扫描 / git 推送 / release / 写 BDS 内存全部不受影响**（这几条路径走的是 `LeviLamina.dll` 导出符号
-   与头文件内联偏移，不经过 `bedrock_runtime.dll`）。
-   同等能力可用 CLI 完成：`packrelay git remote|token|test`、`packrelay scan|once`、`packrelay cdn render`。
-   在 `bedrock_runtime.dll` 正常提供的环境里，`/relaygit` `/relay push` 等指令会自动启用。
+5. **控制台指令依赖 SymbolProvider（链接期能力，不是环境依赖）**。
+   命令 API（`CommandOutput::success` / `CommandRegistry::parse` / `Bedrock::type_id`）的导入由
+   `prelink` 生成的 `bedrock_runtime_api.lib` 指向 `bedrock_runtime.dll`，而后者不是磁盘文件，
+   是 prelink 写入的假模块名；真正把它解析到 `bedrock_server_mod.exe` 真实地址的是
+   **SymbolProvider**（它替换了 `__delayLoadHelper2`，内部调 `ll::memory::resolveSymbol`）。
+
+   SymbolProvider 是 `levilamina` 包的传递依赖（`symbolprovider v1.3.0`），xmake 构建自动链入
+   （CI 产物的 pdb 里可验证）。所以：
+
+   - 插件**不做运行期探测**。早期版本用 `LoadLibraryW("bedrock_runtime.dll")` 探测，永远返回空，
+     导致 `registerCommands()` 被永久跳过、`/relay` 全部 `Unknown command`——那是个错误结论。
+   - 也**不要手写 `__pfnDliNotifyHook2`**：SymbolProvider 已经实现了它，重复定义会 `LNK2005`，
+     且会把正确的解析顶掉（这正是 `0xC06D007E` 的真正来源）。
+   - 命令注册包在 `try/catch(...)` 里（xmake 用 `/EHa`，也能接住 SEH），最坏情况是
+     「命令不可用 + 一条 WARN」，不会把服务器带走；**扫描 / git 推送 / release / 写 BDS 内存
+     全部不经过这条路**，不受影响。
+
+   同等能力随时可用 CLI：`packrelay git remote|token|test`、`packrelay cdn show|render`、
+   `packrelay scan|once`。
 6. 单进程单实例：`.mcpack-sync/` 目录未加文件锁，同一服务器根目录不要同时跑两个 `packrelay`。

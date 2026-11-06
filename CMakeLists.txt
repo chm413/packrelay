@@ -66,44 +66,19 @@ enable_testing()
 add_test(NAME unit COMMAND mcpsync-tests)
 
 # ---------------------------------------------------------------------------
-# LeviLamina mod 目标：仅在 MSVC + 已提供 LL SDK（头文件 + 导入库）时构建。
-# 原因：LeviLamina.dll / bedrock_server.exe 由 MSVC 编译并导出 MSVC 修饰名
-#       （如 ?getModDir@Mod@mod@ll@@QEAAAEBVpath@filesystem@std@@XZ），
-#       MinGW 的 Itanium ABI 无法链接这些符号，必须使用 MSVC 工具链。
+# LeviLamina mod **只由 xmake 构建**（见 xmake.lua），这里刻意不提供 mod 目标。
+#
+# 为什么不用 CMake：mod 需要 LL 的整套包生态 —— bedrockdata 预编译头、entt/gsl/glm/
+# leveldb 等十几个依赖、prelink.exe + bedrock_runtime_data（生成 bedrock_runtime_api.lib）、
+# 以及 symbolprovider（把 delay-load 的 bedrock_runtime.dll 解析到 BDS 真实地址）。
+# 这些由 levimc-repo 的 `levilamina` 包一次性解析，手工在 CMake 里拼不现实。
+#
+# 历史上这里曾有一个 MCPSYNC_BUILD_MOD 分支，但它是错的且从未成功过：
+#   - 只列了 src/mod/levilamina_mod.cpp，漏了 crash_guard.cpp / memory_operators.cpp
+#     （后者缺失会被 LL 以「未使用统一的内存分配运算符」拒绝加载）
+#   - 链 bedrock_server_api / bedrock_server_var，而不是 prelink 生成的导入库
+#   - 输出目录名 mcpack_sync 与 manifest 的 name=packrelay 不一致
+# 保留它只会诱导别人走一条产出「LL 拒绝加载的 dll」的路，因此整段删除。
 # ---------------------------------------------------------------------------
-option(MCPSYNC_BUILD_MOD "Build the LeviLamina mod target" OFF)
-set(LL_SDK_DIR "" CACHE PATH "LeviLamina SDK dir (contains include/ and lib/)")
 
-if(MCPSYNC_BUILD_MOD)
-    if(NOT MSVC)
-        message(FATAL_ERROR
-            "MCPSYNC_BUILD_MOD=ON requires MSVC (cl.exe). "
-            "LeviLamina exports MSVC-mangled symbols; MinGW cannot link them.")
-    endif()
-    if(NOT EXISTS "${LL_SDK_DIR}/include/ll/api/mod/Mod.h")
-        message(FATAL_ERROR "LL_SDK_DIR='${LL_SDK_DIR}' does not look like a LeviLamina SDK")
-    endif()
-
-    add_library(mcpack_sync_mod SHARED src/mod/levilamina_mod.cpp)
-    target_link_libraries(mcpack_sync_mod PRIVATE mcpsync_core)
-    target_include_directories(mcpack_sync_mod PRIVATE
-        ${LL_SDK_DIR}/include
-        ${LL_SDK_DIR}/include/mc
-    )
-    target_link_directories(mcpack_sync_mod PRIVATE ${LL_SDK_DIR}/lib)
-    target_link_libraries(mcpack_sync_mod PRIVATE LeviLamina bedrock_server_api bedrock_server_var)
-    set_target_properties(mcpack_sync_mod PROPERTIES SUFFIX ".mod.dll" PREFIX "")
-
-    # mod 的 manifest.json 与默认配置随产物一起落地
-    add_custom_command(TARGET mcpack_sync_mod POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:mcpack_sync_mod>/mcpack_sync"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/mod/manifest.json"
-                "$<TARGET_FILE_DIR:mcpack_sync_mod>/mcpack_sync/manifest.json"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/config/config.example.json"
-                "$<TARGET_FILE_DIR:mcpack_sync_mod>/mcpack_sync/config.json"
-    )
-endif()
-
-message(STATUS "mcpack-sync ${MCPSYNC_VERSION} | mod target: ${MCPSYNC_BUILD_MOD}")
+message(STATUS "mcpack-sync ${MCPSYNC_VERSION} | LL mod: built by xmake (see xmake.lua)")

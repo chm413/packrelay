@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstdio>
 #include <chrono>
+#include <exception>
 #include <thread>
 
 namespace mcpack_sync::crash {
@@ -117,7 +118,6 @@ private:
     std::atomic<bool> mBootstrapStop{false};
     std::atomic<bool> mBootstrapDone{false};   // 线程函数已返回（join 可立即完成）
     std::atomic<bool> mReadyDone{false};
-    bool              mBdsRuntime{false};      // 加载器是否提供 bedrock_runtime.dll
     bool              mCommandsRegistered{false};
     fs::path          mServerRoot;
     fs::path          mConfigPath;
@@ -198,18 +198,17 @@ bool McpackSyncMod::load() {
     mServerRoot = nativeMod->getModDir().parent_path().parent_path();
     nativeMod->getLogger().info("loading packrelay, server root = {}", mServerRoot.string());
 
-    {
-        // 加载器侧是否提供了 bedrock_runtime.dll（prelink 生成的导入库全靠它）。
-        // 这里只探测，不硬依赖：没有它也能跑扫描/推送，只是不能用 BDS 命令 API。
-        HMODULE h = ::GetModuleHandleW(L"bedrock_runtime.dll");
-        if (!h) h = ::LoadLibraryW(L"bedrock_runtime.dll");
-        mBdsRuntime = (h != nullptr);
-        nativeMod->getLogger().info(
-            "bedrock_runtime.dll available = {} (commands {})",
-            mBdsRuntime,
-            mBdsRuntime ? "enabled" : "disabled"
-        );
-    }
+    // 命令 API（CommandOutput::success / CommandRegistry::parse / Bedrock::type_id）走的是
+    // /DELAYLOAD:bedrock_runtime.dll + prelink 生成的 bedrock_runtime_api.lib。
+    // bedrock_runtime.dll 不是磁盘文件，而是 prelink 写入的假模块名；真正把它解析到
+    // bedrock_server_mod.exe 真实地址的是 SymbolProvider（它替换了 __delayLoadHelper2，
+    // 内部调 ll::memory::resolveSymbol）。
+    //
+    // SymbolProvider 是 levilamina 包（26.60.2）的传递依赖（symbolprovider v1.3.0），
+    // xmake 构建默认就会链上（CI 产物的 pdb 里可以看到它的 lib 路径）。
+    // 因此这是**链接期**能力，不需要也不应该用 GetModuleHandleW/LoadLibraryW 在运行期探测
+    // ——那种探测永远返回空，历史上一度导致命令注册被永久跳过（/relay 全部 Unknown command）。
+    nativeMod->getLogger().info("command symbol provider: SymbolProvider (linked via levilamina package)");
 
     mcpsync::logger().setSink(&forwardLog);
 
@@ -649,44 +648,34 @@ void McpackSyncMod::onServerReady() {
         if (auto m = ll::mod::NativeMod::current()) m->getLogger().warn(s);
     };
 
-    // 重新探测一次：load() 阶段加载器还没把虚拟模块挂上去，这时探测必然失败。
-    // 注意：写 BDS 内存（CDNConfig）走的是 LeviLamina.dll 导出的 getServerInstance()
-    // 加上头文件里的内联偏移访问，完全不依赖 bedrock_runtime.dll；
-    // 只有 BDS 命令 API（CommandOutput::success / CommandRegistry::parse /
-    // Bedrock::type_id）需要它，缺了必须在链接期之外拦掉，否则 delay-load 会带走进程。
-    if (!mBdsRuntime) {
-        HMODULE h = ::GetModuleHandleW(L"bedrock_runtime.dll");
-        if (!h) h = ::LoadLibraryW(L"bedrock_runtime.dll");
-        mBdsRuntime = (h != nullptr);
-    }
-
-    log(std::string("server ready: bedrock_runtime.dll ") + (mBdsRuntime ? "available" : "unavailable"));
-
     // 1) 先用上次落盘的清单把外链补进 BDS 内存。
     //    重启后 CDNConfig 是空的（磁盘配置只在 ServerInstance 构造时读一次），
     //    不补这一遍，首个玩家拿到的是服务端直传而不是外链。
+    //    这条路只依赖 LeviLamina.dll 导出的 getServerInstance() + 头文件内联偏移，
+    //    与命令 API 的符号解析无关。
     log("server ready: pushing cdn urls into BDS memory");
     pushCdnToServer();
     log("server ready: cdn push dispatched");
 
-    // 2) 控制台指令。必须在服务器线程、且在 CommandRegistry 建好之后注册。
-    if (mBdsRuntime) {
-        if (!mCommandsRegistered) {
+    // 2) 控制台指令：无条件注册。
+    //    load() 侧已经保证「getCommandRegistry() 非空」才投递到服务器线程，这里无需再判断。
+    //    try/catch 兜底：xmake 用 /EHa，catch(...) 也能接住 SEH（例如符号解析失败时的
+    //    0xC06D007E），最坏情况是「命令不可用 + 一条 WARN」，不会把服务器带走。
+    if (!mCommandsRegistered) {
+        try {
             log("server ready: registering console commands");
             registerCommands();
             mCommandsRegistered = true;
             log("packrelay console commands registered (/relay, /relaygit)");
+        } catch (std::exception const& e) {
+            warn(std::string("command registration failed: ") + e.what());
+        } catch (...) {
+            warn(
+                "command registration failed (unknown/SEH); console commands are disabled, but scanning, "
+                "git push, release and the CDN url push into BDS memory are unaffected. Use the packrelay CLI "
+                "for the same operations: packrelay git remote|token|test, packrelay cdn show|render, packrelay scan|once."
+            );
         }
-    } else {
-        warn(
-            "BDS command symbols are not resolvable in this build, so console commands (/relay, /relaygit) are "
-            "disabled. Cause is almost always a missing SymbolProvider.lib: it provides __pfnDliNotifyHook2, which "
-            "redirects the delay-loaded bedrock_runtime.dll imports to the real addresses inside bedrock_server_mod.exe. "
-            "Do not hand-write that hook yourself - defining __pfnDliNotifyHook2 will shadow SymbolProvider's and "
-            "break symbol resolution (LNK2005 / 0xC06D007E). Scanning, git push, release and the CDN url push into "
-            "BDS memory are unaffected. The same operations are available through the packrelay CLI: "
-            "packrelay git remote|token|test, packrelay cdn show|render, packrelay scan|once."
-        );
     }
 
     if (mPipeline->config().server.scanOnStart) {
