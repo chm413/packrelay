@@ -679,10 +679,13 @@ void McpackSyncMod::onServerReady() {
         }
     } else {
         warn(
-            "bedrock_runtime.dll is not provided by this loader, so BDS command symbols cannot be resolved. "
-            "Console commands (/relay, /relaygit) are disabled; scanning, git push, release and "
-            "the CDN url push into BDS memory are unaffected. The same operations are available through the "
-            "packrelay CLI: packrelay git remote|token|test, packrelay cdn show|render, packrelay scan|once."
+            "BDS command symbols are not resolvable in this build, so console commands (/relay, /relaygit) are "
+            "disabled. Cause is almost always a missing SymbolProvider.lib: it provides __pfnDliNotifyHook2, which "
+            "redirects the delay-loaded bedrock_runtime.dll imports to the real addresses inside bedrock_server_mod.exe. "
+            "Do not hand-write that hook yourself - defining __pfnDliNotifyHook2 will shadow SymbolProvider's and "
+            "break symbol resolution (LNK2005 / 0xC06D007E). Scanning, git push, release and the CDN url push into "
+            "BDS memory are unaffected. The same operations are available through the packrelay CLI: "
+            "packrelay git remote|token|test, packrelay cdn show|render, packrelay scan|once."
         );
     }
 
