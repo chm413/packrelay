@@ -731,6 +731,61 @@ void testValidateConfig() {
 
 } // namespace
 
+void testManifestLangResolution() {
+    namespace fs = std::filesystem;
+    auto root    = fs::temp_directory_path() / ("mcpsync-lang-" + std::to_string(fsu::nowUnix()));
+    fsu::removeAll(root);
+
+    // 真实资源包的写法：header.name 是翻译键，真名在 texts/<locale>.lang
+    auto packDir = root / "kt";
+    fsu::ensureDir(packDir / "texts");
+    fsu::writeFile(packDir / "manifest.json", R"({
+        "format_version": 2,
+        "header": { "name": "pack.name", "description": "pack.description",
+                    "uuid": "541650da-507a-473a-b2f1-162103ffc351", "version": [1,0,3] },
+        "modules": [ { "type": "resources", "uuid": "01758289-b7c9-4a2a-ba7b-a8e106e42aaa", "version": [1,0,3] } ]
+    })");
+    // de_DE 排在字典序前面，用来验证语言优先级不是按文件名取第一个
+    fsu::writeFile(packDir / "texts" / "de_DE.lang", "pack.name=Kaleidoskop Tavern\n");
+    fsu::writeFile(packDir / "texts" / "en_US.lang",
+                   "## 注释行不该被当成键\npack.name=Kaleidoscope Tavern v1.0.3 [RP]\npack.description=desc\n");
+
+    auto id = parseManifest(packDir / "manifest.json");
+    CHECK(id.ok());
+    CHECK_EQ(id.value().name, std::string("Kaleidoscope Tavern v1.0.3 [RP]"));
+
+    PackSnapshot s;
+    s.id = id.value();
+    CHECK_EQ(s.slug(), std::string("kaleidoscope-tavern-v1.0.3-rp"));
+
+    // 没有 texts 时保留原键，slug 仍退回 uuid
+    auto plain = root / "plain";
+    fsu::ensureDir(plain);
+    fsu::writeFile(plain / "manifest.json", R"({
+        "format_version": 2,
+        "header": { "name": "pack.name", "uuid": "541650da-507a-473a-b2f1-162103ffc351", "version": [1,0,0] }
+    })");
+    auto id2 = parseManifest(plain / "manifest.json");
+    CHECK(id2.ok());
+    CHECK_EQ(id2.value().name, std::string("pack.name"));
+    PackSnapshot s2;
+    s2.id = id2.value();
+    CHECK_EQ(s2.slug(), std::string("541650da-507a-473a-b2f1-162103ffc351"));
+
+    // 普通文本名字不受影响
+    auto named = root / "named";
+    fsu::ensureDir(named);
+    fsu::writeFile(named / "manifest.json", R"({
+        "format_version": 2,
+        "header": { "name": "Packrelay Probe", "uuid": "c2f55d81-ea6b-4086-ac5c-97841795f997", "version": [1,0,0] }
+    })");
+    auto id3 = parseManifest(named / "manifest.json");
+    CHECK(id3.ok());
+    CHECK_EQ(id3.value().name, std::string("Packrelay Probe"));
+
+    fsu::removeAll(root);
+}
+
 int main() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -739,6 +794,7 @@ int main() {
     testJson();
     testGlob();
     testVersionAndSlug();
+    testManifestLangResolution();
     testMirror();
     testPackCdnEntries();
     testUpsertPackCdnUrls();

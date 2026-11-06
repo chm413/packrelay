@@ -749,6 +749,34 @@ IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash ident
 | `scanOnWorldLoad` / `shutdownTimeoutMs` 配了不生效 | 文档承诺的功能是空的 | 前者只解析没接线，后者只解析没使用。修复：世界就绪改用 `getLevel()` 轮询探测（本机 LL 上 `EventBus::addListener` 对 `ServerStartedEvent` 直接返回 `false`，事件永不派发，故不能用事件）；停服改为可中断轮询 + 有界等待，超时则故意泄漏 Pipeline 以免工作线程访问已析构对象 |
 | `cdn.mode` 三个模式只有一种行为 | `static` / `staticUrl` 配了没用，`mode` 写错也不报错 | `mode` 全程没有被分支，`staticUrl` 只出现在校验里。修复：`static` 走 `staticUrl + "/" + assetName` 且不等 Release；非法取值在 `validateConfig` 拒绝；`scan`/`watch` 补上校验（原先只有 `once` 和 mod 校验） |
 
+### 11.5 真实资源包：Kaleidoscope Tavern v1.0.3（1980 文件 / 19.1 MB）
+
+前面用的 probe 包只有 3 个文件，名字也是纯文本，绕开了真实资源包的两个特征：
+**体量**（近 2000 个文件）和 **i18n 名字**（`header.name` 是 `pack.name` 这类翻译键）。
+
+用真实包重跑，第一条就暴露了问题：包名、slug、tag、CDN 清单里全是 `pack.name` / uuid——
+`texts/*.lang` 里的真名从来没被读过。修复后（`scanner.cpp` 的 `resolveLangValue`，
+语言按 en_US → en_GB → zh_CN → zh_TW → 其它 排序，跳过 `##` 注释行）整条链才可读：
+
+| 阶段 | 结果 |
+|---|---|
+| 扫描 | 1 pack / 1980 files / 19148 KiB / 3.9s |
+| slug | `kaleidoscope-tavern-v1.0.3-rp`（修复前是 `541650da-507a-...`） |
+| tag | `kaleidoscope-tavern-v1.0.3-rp-v1.0.3-ae24301a` |
+| 全量发布 | 47s（扫描 → push → 等 Release → 写 CDN） |
+| Release 资产 | 4,580,878 B（19.1 MB 压到 4.4 MB） |
+| zip 内容 | 1980 文件 / 19,607,824 B，抽样 sha256 与源目录逐字节一致 |
+| 二次运行 | `unchanged=1`，3.1s，不重复 push、不重复发版 |
+| 增量（改 1 个 lang） | `updated=1`，42s，新 tag `...-300e00eb`，**目录名不变** |
+| 镜像 | 直连 302、`ghfast.top` 200，下载 4,580,917 B（正好多出新增的 39 字节） |
+
+增量那一行是关键：slug 来自 `header.name`，而真实包名里带版本号。若 slug 跟着版本走，
+每次升级都会在仓库里多一个目录、旧目录永远留着。现有实现靠 `state.json` 里记的旧 slug
+在更新时沿用（`pipeline.cpp`），所以目录稳定；这条行为有单元测试锁着，不要"顺手优化"。
+
+> 实测用 `git.authMode=token_env` + `MCPACK_GIT_TOKEN`，走 HTTPS 的 `http.extraheader`
+> 注入 basic 认证，不落盘、不依赖系统凭据管理器。
+
 ---
 
 ## 12. 已知限制

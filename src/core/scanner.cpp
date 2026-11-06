@@ -48,6 +48,64 @@ Result<std::string> hashFile(std::filesystem::path const& p, uint64_t& sizeOut) 
     return h.hexDigest();
 }
 
+// manifest 的 header.name 在真实资源包里几乎都是 i18n key（"pack.name"），
+// 实际名字写在 texts/<locale>.lang 里。不解析的话，包名、slug、tag、CDN 清单
+// 全是这个 key，可读性为零。语言按 en_US → en_GB → zh_CN → zh_TW → 其它 排序。
+std::string resolveLangValue(std::filesystem::path const& packDir, std::string const& key) {
+    if (key.empty() || key.find(' ') != std::string::npos) return {};
+
+    std::error_code ec;
+    auto            texts = packDir / "texts";
+    if (!std::filesystem::is_directory(texts, ec)) return {};
+
+    auto rank = [](std::string const& n) {
+        static char const* pref[] = {"en_US.lang", "en_GB.lang", "zh_CN.lang", "zh_TW.lang"};
+        for (int i = 0; i < 4; ++i) {
+            if (n == pref[i]) return i;
+        }
+        return 100;
+    };
+
+    std::vector<std::filesystem::path> files;
+    for (auto const& e : std::filesystem::directory_iterator(texts, ec)) {
+        if (!e.is_regular_file()) continue;
+        auto name = e.path().filename().string();
+        if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".lang") != 0) continue;
+        files.push_back(e.path());
+    }
+    if (files.empty()) return {};
+
+    std::sort(files.begin(), files.end(), [&](auto const& a, auto const& b) {
+        auto ra = rank(a.filename().string());
+        auto rb = rank(b.filename().string());
+        if (ra != rb) return ra < rb;
+        return a.filename().string() < b.filename().string();
+    });
+
+    for (auto const& p : files) {
+        std::string text;
+        auto        st = fsu::readFile(p, text);
+        if (!st) continue;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t      nl = text.find('\n', pos);
+            if (nl == std::string::npos) nl = text.size();
+            std::string line = text.substr(pos, nl - pos);
+            pos              = nl + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            if (line.compare(0, eq, key) != 0) continue;
+            std::string val = line.substr(eq + 1);
+            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
+            if (!val.empty()) return val;
+        }
+    }
+    return {};
+}
+
 // 广度优先收集所有包含 manifest.json 的目录（不进入 .git / .mcpack-sync）
 void collectPackDirs(std::filesystem::path const& root, std::vector<std::filesystem::path>& out) {
     namespace sfs = std::filesystem;
@@ -100,6 +158,12 @@ Result<PackIdentity> parseManifest(std::filesystem::path const& manifestPath) {
     id.uuid        = header.at("uuid").asString();
     id.name        = header.at("name").asString();
     id.description = header.at("description").asString();
+
+    // name 多半是 "pack.name" 这类翻译键，真实名字在 texts/<locale>.lang 里
+    if (!id.name.empty()) {
+        auto localized = resolveLangValue(manifestPath.parent_path(), id.name);
+        if (!localized.empty()) id.name = localized;
+    }
     if (id.uuid.empty()) {
         return Error{ErrCode::Parse, "manifest.json header.uuid missing: " + fsu::toUtf8(manifestPath)};
     }
