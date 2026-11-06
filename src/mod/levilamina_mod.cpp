@@ -74,12 +74,24 @@ public:
     // 退出流程里 LL 并不总会调用 unload()，所以必须在这里兜底。
     ~McpackSyncMod() {
         mBootstrapStop.store(true);
-        if (!mBootstrap.joinable()) return;
-        if (mBootstrapDone.load()) {
-            mBootstrap.join(); // 线程已返回，join 立即完成
-        } else {
-            // ExitProcess 阶段其他线程已被系统终止，detach 是安全的
-            mBootstrap.detach();
+        if (mBootstrap.joinable()) {
+            if (mBootstrapDone.load()) {
+                mBootstrap.join(); // 线程已返回，join 立即完成
+            } else {
+                // ExitProcess 阶段其他线程已被系统终止，detach 是安全的
+                mBootstrap.detach();
+            }
+        }
+
+        // 正常 stop 时 LL 既不派发 ServerStoppingEvent 也不调 unload()，所以停服收尾
+        // 实际走的是这里：按 shutdownTimeoutMs 有界等待；超时则放掉所有权（故意泄漏），
+        // 让工作线程继续持有一个有效对象直到进程结束——绝不会析构正在被使用的 Pipeline。
+        if (mPipeline && !mPipelineLeaked.load()) {
+            int const budget = mPipeline->config().server.shutdownTimeoutMs;
+            if (!mPipeline->stopWatcherWithTimeout(budget)) {
+                mPipelineLeaked.store(true);
+                (void)mPipeline.release();
+            }
         }
     }
 
@@ -113,6 +125,10 @@ private:
     std::unique_ptr<mcpsync::Pipeline> mPipeline;
     std::shared_ptr<ll::event::Listener<ll::event::server::ServerStartedEvent>>  mStartListener;
     std::shared_ptr<ll::event::Listener<ll::event::server::ServerStoppingEvent>> mStopListener;
+    // scanOnWorldLoad：世界（Level）就绪后补一次扫描，见 mBootstrap 里的探测循环
+    std::atomic<bool> mWorldScanFired{false};
+    // 停服超时后流水线线程仍在跑：对象故意泄漏，绝不能再 destroy（否则是悬垂指针）
+    std::atomic<bool> mPipelineLeaked{false};
     std::mutex        mReloadMtx;
     std::thread       mBootstrap;
     std::atomic<bool> mBootstrapStop{false};
@@ -243,6 +259,23 @@ bool McpackSyncMod::load() {
         for (int i = 0; i < 600 && !mBootstrapStop.load(); ++i) {
             if (ll::service::bedrock::getCommandRegistry()) {
                 postServerReady();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+
+        // scanOnWorldLoad：等世界真正就绪（Level 可拿到）后再补一次扫描。
+        // 这里同样不用 EventBus：本机 LL 26.60.2 上 ServerStartedEvent / ServerLevelTickEvent
+        // 的 addListener 会直接返回 false（事件永不派发，日志 "listener registered = false"），
+        // 所以和上面的命令注册一样走服务探测。
+        if (!mPipeline || !mPipeline->config().server.scanOnWorldLoad) return;
+
+        for (int i = 0; i < 240 && !mBootstrapStop.load(); ++i) {
+            if (ll::service::bedrock::getLevel()) {
+                if (mWorldScanFired.exchange(true)) return;
+                if (mPipelineLeaked.load()) return;
+                mcpsync::logger().info("scanOnWorldLoad: level is ready, requesting a scan");
+                mPipeline->requestScan();
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -253,7 +286,15 @@ bool McpackSyncMod::load() {
         [this](ll::event::server::ServerStoppingEvent&) {
             self()->getLogger().info("server stopping, flushing state");
             if (!mPipeline) return;
-            mPipeline->stopWatcher();
+            int const budget = mPipeline->config().server.shutdownTimeoutMs;
+            if (!mPipeline->stopWatcherWithTimeout(budget)) {
+                mPipelineLeaked.store(true);
+                self()->getLogger().warn(
+                    "pipeline did not stop within {}ms; it will be left running and leaked at unload",
+                    budget
+                );
+                return;
+            }
             mPipeline->state().save();
         }
     );
@@ -275,9 +316,20 @@ bool McpackSyncMod::unload() {
         mStopListener.reset();
     }
     if (mPipeline) {
-        mPipeline->stopWatcher();
-        mPipeline->state().save();
-        mPipeline.reset();
+        if (mPipelineLeaked.load()) {
+            // 线程仍在用这个对象：只能放掉所有权，让它在进程退出时自然消失
+            (void)mPipeline.release();
+        } else {
+            int const budget = mPipeline->config().server.shutdownTimeoutMs;
+            if (!mPipeline->stopWatcherWithTimeout(budget)) {
+                mPipelineLeaked.store(true);
+                if (self) self->getLogger().warn("pipeline still running at unload, leaking it to keep its worker safe");
+                (void)mPipeline.release();
+            } else {
+                mPipeline->state().save();
+                mPipeline.reset();
+            }
+        }
     }
     if (self) self->getLogger().info("packrelay unloaded");
     return true;

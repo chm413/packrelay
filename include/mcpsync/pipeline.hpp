@@ -74,6 +74,10 @@ public:
     // 周期执行（引擎自身调度；mod 场景下由事件驱动）
     void startWatcher();
     void stopWatcher();
+    // 有界停止：最多等 timeoutMs 让工作线程收尾。
+    // 返回 false 表示超时仍在运行——调用方必须保证 Pipeline 对象不在此后被销毁
+    // （mod 侧的做法是故意泄漏，进程即将退出，泄漏比悬垂指针安全）。
+    bool stopWatcherWithTimeout(int timeoutMs);
     bool watching() const { return mWatching.load(); }
 
     // 供 mod 事件回调：请求尽快执行一次
@@ -110,6 +114,10 @@ private:
     std::atomic<bool>         mScanRequested{false};
     std::atomic<uint64_t>     mRunCount{0};
     std::thread               mWatchThread;
+
+    std::mutex                mExitMtx;
+    std::condition_variable   mExitCv;
+    std::atomic<bool>         mWatchExited{false};
 
     mutable std::mutex        mReportMtx;
     std::unique_ptr<PipelineReport> mLastReport;

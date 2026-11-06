@@ -87,12 +87,20 @@ Result<Release> GithubClient::releaseByTag(std::string const& tag) {
     return fetch(url);
 }
 
-Result<Release> GithubClient::waitForRelease(std::string const& tag, int pollMs, int timeoutMs) {
+Result<Release> GithubClient::waitForRelease(
+    std::string const&       tag,
+    int                      pollMs,
+    int                      timeoutMs,
+    std::atomic<bool> const* cancel
+) {
     auto start = std::chrono::steady_clock::now();
     int  attempt = 0;
     std::string lastErr;
 
     for (;;) {
+        if (cancel && cancel->load()) {
+            return Error{ErrCode::Release, "release wait cancelled by shutdown", tag, true};
+        }
         ++attempt;
         auto r = releaseByTag(tag);
         if (r) {
@@ -114,7 +122,16 @@ Result<Release> GithubClient::waitForRelease(std::string const& tag, int pollMs,
                          lastErr, true};
         }
         logger().debug("waiting for release " + tag + " (attempt " + std::to_string(attempt) + "): " + lastErr);
-        std::this_thread::sleep_for(std::chrono::milliseconds(pollMs));
+        // 分片睡眠：停服请求不必等满一个轮询周期才响应
+        int remaining = pollMs;
+        while (remaining > 0) {
+            if (cancel && cancel->load()) {
+                return Error{ErrCode::Release, "release wait cancelled by shutdown", tag, true};
+            }
+            int const step = remaining < 100 ? remaining : 100;
+            std::this_thread::sleep_for(std::chrono::milliseconds(step));
+            remaining -= step;
+        }
     }
 }
 

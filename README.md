@@ -113,7 +113,8 @@ mod 场景固定为服务器根目录，保证升级重装后状态不漂移）�
 | 根 | `resourceDir` | 资源根目录，递归查找 `manifest.json` |
 | | `baseDir` | 相对路径基准 |
 | `server` | `scanIntervalSeconds` | 周期扫描间隔 |
-| | `scanOnStart` / `scanOnWorldLoad` | 启动 / 世界加载时触发 |
+| | `scanOnStart` / `scanOnWorldLoad` | 启动时触发 / World（Level 可获取）后补一次扫描 |
+| | `shutdownTimeoutMs` | 停服等待流水线收尾的上限；超时则放手（对象故意泄漏）避免卡死进程 |
 | | `debounceMs` | 事件触发去抖，避免连续写盘打爆扫描 |
 | `identity` | `conflictPolicy` | 同 uuid 多目录策略 |
 | | `ignorePatterns` | 通配（`**`、`*`、`?`，大小写不敏感） |
@@ -130,7 +131,8 @@ mod 场景固定为服务器根目录，保证升级重装后状态不漂移）�
 | | `waitForRelease` / `pollIntervalMs` / `pollTimeoutMs` | 轮询策略；`waitForRelease=false` 时用 URL 规则推导 |
 | `github` | `apiBase` / `owner` / `repo` | 可在 GitHub Enterprise / 本地 mock 间切换 |
 | | `tokenEnv` / `proxy` / `timeoutMs` / `maxRetries` | 认证、代理、重试 |
-| `cdn` | `mode` | `release_asset` / `mirror_template` / `static` |
+| `cdn` | `mode` | `release_asset`（默认，等 Release）/ `static`（外部静态托管，用 `staticUrl` 拼地址、不等 Release）；`mirror_template` 为历史等价取值 |
+| | `staticUrl` | `mode=static` 时的基址，最终地址 = `staticUrl + "/" + assetName` |
 | | `mirrors[]` | `{name, enabled, priority, prefix}` 或 `{..., template}`，两种写法见下节 |
 | | `activeMirror` | `auto`（按 priority 取最高）或镜像名，如 `"ghfast"` |
 | | `writeManifest` / `manifestFile` | 写 `.mcpack-sync/cdn.json` 供外部分发层消费 |
@@ -696,6 +698,8 @@ IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash ident
 | `git add -A` 在 BDS 内卡满 60s 超时 | 推送链路完全不可用（standalone 0.2s） | 子进程继承了 BDS 的 stdin 管道读端，卡在启动期等待。修复：无输入时把子进程 stdin 指向 NUL 设备 |
 | 插件铺的 `release-packs` workflow 失败 | release 永远建不出来，判据断在「等 release」 | `ci-release.sh` 先 `mkdir ./.releases/<tag>` 再 `cd packs/<slug>` 后用**相对路径** zip——cd 后相对路径解析到包目录里去了。e2e 没抓到是因为 `--fs` 模式传的是绝对路径。修复：cd 前转绝对路径 |
 | `/relay` 永远 `Unknown command` | 控制台指令不可用 | `LoadLibraryW("bedrock_runtime.dll")` 探测永远为空（它不是磁盘文件），命令注册被永久跳过；且手写的 `__pfnDliNotifyHook2` 顶掉了 SymbolProvider。修复：删探测、删手写 hook，无条件注册 + try/catch 兜底 |
+| `scanOnWorldLoad` / `shutdownTimeoutMs` 配了不生效 | 文档承诺的功能是空的 | 前者只解析没接线，后者只解析没使用。修复：世界就绪改用 `getLevel()` 轮询探测（本机 LL 上 `EventBus::addListener` 对 `ServerStartedEvent` 直接返回 `false`，事件永不派发，故不能用事件）；停服改为可中断轮询 + 有界等待，超时则故意泄漏 Pipeline 以免工作线程访问已析构对象 |
+| `cdn.mode` 三个模式只有一种行为 | `static` / `staticUrl` 配了没用，`mode` 写错也不报错 | `mode` 全程没有被分支，`staticUrl` 只出现在校验里。修复：`static` 走 `staticUrl + "/" + assetName` 且不等 Release；非法取值在 `validateConfig` 拒绝；`scan`/`watch` 补上校验（原先只有 `once` 和 mod 校验） |
 
 ---
 

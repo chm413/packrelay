@@ -38,6 +38,14 @@ std::string renderPlaceholders(std::string tmpl, PackSnapshot const& snap) {
     return out;
 }
 
+// 拼接 URL：消除 base 结尾与 tail 开头重复的 '/'
+std::string urlJoin(std::string base, std::string const& tail) {
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    size_t i = 0;
+    while (i < tail.size() && tail[i] == '/') ++i;
+    return base + "/" + tail.substr(i);
+}
+
 RepoIndexEntry toIndexEntry(PackSnapshot const& snap) {
     RepoIndexEntry e;
     e.uuid        = snap.id.uuid;
@@ -202,6 +210,30 @@ bool Pipeline::finishRelease(PackState& st, PackSnapshot const& snap, PipelineOp
         return true;
     }
 
+    if (mCfg.cdn.mode == "static") {
+        // 静态托管：包由外部（对象存储 / 自建站 / GitHub Pages）提供，不在 GitHub Release 上，
+        // 因此不轮询 Release API；地址 = cdn.staticUrl + "/" + assetName。
+        // 镜像前缀是为 GitHub 域名设计的，套到自有域名上只会拼出错误地址，故这里不套镜像。
+        target.assetUrl  = urlJoin(mCfg.cdn.staticUrl, target.assetName);
+        target.mirror    = "static";
+        target.publicUrl = target.assetUrl;
+
+        auto cst = mCdn.apply(target, mCfg.github.owner, mCfg.github.repo);
+        if (!cst) logger().warn("cdn apply: " + cst.error().str());
+        else if (onCdnPublished && !mStop.load()) onCdnPublished();
+
+        st.release.tag         = target.tag;
+        st.release.assetName   = target.assetName;
+        st.release.assetUrl    = target.assetUrl;
+        st.release.publicUrl   = target.publicUrl;
+        st.release.publishedAt = target.updatedAt;
+        st.releasePending      = false;
+        out.tag                = target.tag;
+        out.cdnUrl             = target.publicUrl;
+        out.message            = "cdn.mode=static, url composed from cdn.staticUrl";
+        return true;
+    }
+
     if (!mCfg.release.waitForRelease || opts.skipRelease) {
         // 不等 release API 时用 GitHub 资产 URL 规则直接拼接完整地址：
         // https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
@@ -215,7 +247,7 @@ bool Pipeline::finishRelease(PackState& st, PackSnapshot const& snap, PipelineOp
 
         auto cst = mCdn.apply(target, mCfg.github.owner, mCfg.github.repo);
         if (!cst) logger().warn("cdn apply: " + cst.error().str());
-        else if (onCdnPublished) onCdnPublished();
+        else if (onCdnPublished && !mStop.load()) onCdnPublished();
 
         st.release.tag         = target.tag;
         st.release.assetName   = target.assetName;
@@ -229,7 +261,7 @@ bool Pipeline::finishRelease(PackState& st, PackSnapshot const& snap, PipelineOp
         return true;
     }
 
-    auto rel = mGh.waitForRelease(target.tag, mCfg.release.pollIntervalMs, mCfg.release.pollTimeoutMs);
+    auto rel = mGh.waitForRelease(target.tag, mCfg.release.pollIntervalMs, mCfg.release.pollTimeoutMs, &mStop);
     if (!rel) {
         st.releasePending = true;
         out.stage         = "release";
@@ -259,7 +291,7 @@ bool Pipeline::finishRelease(PackState& st, PackSnapshot const& snap, PipelineOp
 
     auto cst = mCdn.apply(target, mCfg.github.owner, mCfg.github.repo);
     if (!cst) logger().warn("cdn apply: " + cst.error().str());
-    else if (onCdnPublished) onCdnPublished();
+    else if (onCdnPublished && !mStop.load()) onCdnPublished();
 
     out.tag    = r.tagName;
     out.cdnUrl = target.publicUrl;
@@ -572,7 +604,54 @@ void Pipeline::stopWatcher() {
     logger().info("pipeline: watcher stopped");
 }
 
+bool Pipeline::stopWatcherWithTimeout(int timeoutMs) {
+    if (!mWatching.exchange(false)) return true;
+    mStop.store(true);
+    mCv.notify_all();
+
+    if (!mWatchThread.joinable()) return true;
+
+    if (timeoutMs <= 0) {
+        mWatchThread.join();
+        logger().info("pipeline: watcher stopped");
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lk(mExitMtx);
+    bool const exited = mExitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [this] {
+        return mWatchExited.load();
+    });
+    lk.unlock();
+
+    if (exited) {
+        mWatchThread.join();
+        logger().info("pipeline: watcher stopped within " + std::to_string(timeoutMs) + "ms budget");
+        return true;
+    }
+
+    // 超时：交给调用方决定对象生命周期，这里只能 detach（否则 join 会永久阻塞停服）
+    mWatchThread.detach();
+    logger().warn(
+        "pipeline: watcher still running after " + std::to_string(timeoutMs) +
+        "ms, detached; it will finish in the background and the process is exiting anyway"
+    );
+    return false;
+}
+
 void Pipeline::watcherLoop() {
+    struct ExitSignal {
+        std::atomic<bool>&        flag;
+        std::mutex&               mtx;
+        std::condition_variable&  cv;
+        ~ExitSignal() {
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                flag.store(true);
+            }
+            cv.notify_all();
+        }
+    } exitSignal{mWatchExited, mExitMtx, mExitCv};
+
     if (mCfg.server.scanOnStart) {
         auto rep = runOnce();
         if (!rep.ok) logger().warn("initial scan reported errors: " + rep.error);

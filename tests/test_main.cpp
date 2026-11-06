@@ -705,6 +705,30 @@ void testRepoTemplates() {
     fsu::removeAll(root);
 }
 
+void testValidateConfig() {
+    Config cfg;
+    cfg.resourceDir  = "packs";
+    cfg.git.enabled  = false; // 本用例只关心 cdn.mode 规则
+
+    // cdn.mode：三种取值合法，其余拒绝；static 必须给 staticUrl
+    cfg.cdn.mode = "release_asset";
+    CHECK(validateConfig(cfg).ok());
+    cfg.cdn.mode = "mirror_template"; // 历史取值，与 release_asset 等价
+    CHECK(validateConfig(cfg).ok());
+    cfg.cdn.mode = "static";
+    CHECK(!validateConfig(cfg).ok());
+    cfg.cdn.staticUrl = "https://cdn.example.com/packs";
+    CHECK(validateConfig(cfg).ok());
+    cfg.cdn.mode = "bogus";
+    CHECK(!validateConfig(cfg).ok());
+
+    // 默认配置本身必须能通过校验（防止默认值漂移成非法值）
+    Config def;
+    def.resourceDir = "packs";
+    def.git.enabled = false;
+    CHECK(validateConfig(def).ok());
+}
+
 } // namespace
 
 int main() {
@@ -721,6 +745,7 @@ int main() {
     testBdsCdnConfigFile();
     testGitAuth();
     testConfig();
+    testValidateConfig();
     testScannerAndDiff();
     testStateAtomic();
     testRepoTemplates();

@@ -138,11 +138,21 @@ int cmdInitConfig(Args const& a) {
     return 0;
 }
 
-int cmdScan(Args const& a) {
+// 加载配置并做语义校验：所有会构造 Pipeline 的命令都必须走这里，
+// 避免 `scan` / `watch` 拿着非法配置（例如 cdn.mode 写错）一路跑到运行时才出问题。
+Result<Config> loadChecked(Args const& a) {
     auto cfgPath = fsu::fromUtf8(a.get("config", "config/packrelay/config.json"));
     auto cfg     = loadConfig(cfgPath);
+    if (!cfg) return cfg.error();
+    auto v = validateConfig(cfg.value());
+    if (!v) return v.error();
+    return cfg.value();
+}
+
+int cmdScan(Args const& a) {
+    auto cfg = loadChecked(a);
     if (!cfg) {
-        std::printf("加载配置失败: %s\n", cfg.error().str().c_str());
+        std::printf("配置校验失败: %s\n", cfg.error().str().c_str());
         return 2;
     }
     Pipeline p(cfg.value());
@@ -230,15 +240,9 @@ int cmdCdn(Args const& a) {
 }
 
 int cmdOnce(Args const& a) {
-    auto cfgPath = fsu::fromUtf8(a.get("config", "config/packrelay/config.json"));
-    auto cfg     = loadConfig(cfgPath);
+    auto cfg = loadChecked(a);
     if (!cfg) {
-        std::printf("加载配置失败: %s\n", cfg.error().str().c_str());
-        return 2;
-    }
-    auto v = validateConfig(cfg.value());
-    if (!v) {
-        std::printf("配置校验失败: %s\n", v.error().str().c_str());
+        std::printf("配置校验失败: %s\n", cfg.error().str().c_str());
         return 2;
     }
     Pipeline p(cfg.value());
@@ -257,10 +261,9 @@ int cmdOnce(Args const& a) {
 }
 
 int cmdWatch(Args const& a) {
-    auto cfgPath = fsu::fromUtf8(a.get("config", "config/packrelay/config.json"));
-    auto cfg     = loadConfig(cfgPath);
+    auto cfg = loadChecked(a);
     if (!cfg) {
-        std::printf("加载配置失败: %s\n", cfg.error().str().c_str());
+        std::printf("配置校验失败: %s\n", cfg.error().str().c_str());
         return 2;
     }
     Pipeline p(cfg.value());

@@ -208,6 +208,15 @@ Status validateConfig(Config const& cfg) {
             return Error{ErrCode::Config, "git.branch is empty"};
         }
     }
+    // cdn.mode：release_asset（默认，等 GitHub Release）/ static（外部静态托管，用 staticUrl 拼地址）。
+    // mirror_template 是历史取值，行为与 release_asset 完全一致（镜像模板在两种模式下都生效），
+    // 保留只为兼容旧配置。
+    if (cfg.cdn.mode != "release_asset" && cfg.cdn.mode != "mirror_template" && cfg.cdn.mode != "static") {
+        return Error{
+            ErrCode::Config,
+            "cdn.mode must be release_asset | mirror_template | static (got '" + cfg.cdn.mode + "')"
+        };
+    }
     if (cfg.cdn.mode == "static" && cfg.cdn.staticUrl.empty()) {
         return Error{ErrCode::Config, "cdn.mode=static requires cdn.staticUrl"};
     }
