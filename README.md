@@ -777,6 +777,28 @@ IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash ident
 > 实测用 `git.authMode=token_env` + `MCPACK_GIT_TOKEN`，走 HTTPS 的 `http.extraheader`
 > 注入 basic 认证，不落盘、不依赖系统凭据管理器。
 
+真机验证（LLBDS 26.60.2 / BDS 1.26.60.6，用的是 CI 产出的 mod DLL）：
+
+```
+IFO [packrelay] state loaded: 1 pack(s) from .\.mcpack-sync/state.json
+IFO [packrelay] cdn: restored 1 target(s), redirect -> .../kaleidoscope-tavern-v1.0.3-rp-.../....zip
+IFO [packrelay] packrelay ready: resourceDir=.\../.tmp/real/packs, git.enabled=true
+IFO [packrelay] pipeline: 1 pack(s), 1980 file(s), 19148 KiB, 963ms
+IFO [packrelay] cdn: pushed 1 pack(s) into BDS CDNConfig, mPackCDNUrls now 5 entries
+IFO [packrelay] cdn:   [541650da-507a-473a-b2f1-162103ffc351_1.0.3] -> https://ghfast.top/...
+IFO [Server]   541650da-... v1.0.3 (ghfast) -> https://ghfast.top/...      ← BDS 自己解析出来的
+IFO [Server] OK packs=1 files=1980 added=0 updated=0 removed=0 unchanged=1 elapsed=963ms
+IFO [Server] cdn kaleidoscope-tavern-v1.0.3-rp -> https://ghfast.top/... (ghfast)   ← /relay cdn
+Quit correctly
+```
+
+`mPackCDNUrls now 5 entries` 里有两对是 probe 包的残留（BDS 的 `cdn_config.json` 还留着），
+本次真正写进去的是 `541650da-..._1.0.3` 那一条。
+
+> 一个容易踩的点：mod 的 `reload()` 会把 `baseDir` **强制覆盖成服务器根目录**
+> （避免 mod 重装后状态漂移），所以配置文件里写绝对 `baseDir` 不生效；
+> `resourceDir` 只能用相对服务器根的路径（如 `../packs`）。
+
 ---
 
 ## 12. 已知限制
