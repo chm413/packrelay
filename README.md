@@ -534,6 +534,35 @@ packrelay package --input <dir> --output <zip> [--json]
 packrelay dump-state --config <cfg>
 ```
 
+### 9.3 仓库元数据（description / topics）
+
+`git push` 只搬代码，搬不走仓库的 description 和 topics——它们存在仓库设置里。对应的两个 REST 端点
+（`PATCH /repos/{owner}/{repo}`、`PUT /repos/{owner}/{repo}/topics`）要求 **Administration:write**，
+而推代码只需要 **contents:write**。这是两套权限：SSH key 再完整也改不了后者，PAT 只给代码权限时
+会得到一句 `403 Resource not accessible by personal access token`。
+
+所以这两项没有"随手改一下"的余地，只能声明化：
+
+```bash
+scripts/sync-repo-metadata.sh --dry-run   # 打印将要发送的请求体，不落任何写
+scripts/sync-repo-metadata.sh --check     # 只比对；public 仓库不需要 token，有差异 exit 1
+GITHUB_TOKEN=... scripts/sync-repo-metadata.sh   # 应用，幂等，只写真有差异的字段
+```
+
+内容写在 `scripts/repo-metadata.conf`（`REPO_DESCRIPTION` / `REPO_HOMEPAGE` / `REPO_TOPICS`），
+和代码一起 review、一起回滚。token 需要 **Administration: Read and write**（fine-grained，且
+Repository access 要包含本仓库），或 classic PAT 勾 `repo`。权限不够时脚本会直接指出缺哪一项，
+`--dry-run` 也能在没有 token 的情况下先看结果。
+
+`--check` 可以挂进 CI 当门禁，但要为此在 secret 里放一个高权限 token——为两行元数据不值当，
+默认没有接。
+
+回归：`bash scripts/e2e-repo-metadata.sh`。它起一个本地 mock（`scripts/mock-gh-meta-server.mjs`，
+按真实语义区分 contents / administration 权限），跑 8 条断言：dry-run 零写入、漂移检测、缺 token、
+403 指引、应用成功、读回一致、幂等、只改 topics 时不动 description。不联网、不需要真 token，
+也不会碰到真实仓库。其中"读回一致"这条是防回归的关键：请求体一旦按 GBK 发出去、或读回时把值里的
+`\"` 当成字符串结尾，表现都是**服务端 200 但内容错/永远判定有差异**，属于静默污染。
+
 ---
 
 ## 10. LLBDS 测试环境搭建（本机实测步骤）
@@ -750,3 +779,7 @@ IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash ident
    同等能力随时可用 CLI：`packrelay git remote|token|test`、`packrelay cdn show|render`、
    `packrelay scan|once`。
 6. 单进程单实例：`.mcpack-sync/` 目录未加文件锁，同一服务器根目录不要同时跑两个 `packrelay`。
+7. **仓库 description / topics 不受版本控制**：见 §9.3。写它们要 Administration:write，
+   `git push` 用的是 contents:write，两套权限不通用，自动化流水线也带不动它。
+   内容已声明在 `scripts/repo-metadata.conf`，用 `scripts/sync-repo-metadata.sh` 幂等应用；
+   没有对应权限的 token 时，这一项只能停在"配置就绪、等待一次授权"的状态。

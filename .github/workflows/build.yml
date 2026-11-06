@@ -40,6 +40,13 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure -C Release
 
+      # 仓库元数据同步脚本的回归：起本地 mock，8 条断言，不联网、不需要真 token。
+      # 只在 Linux 跑——Windows runner 的 Git Bash 对后台进程和 kill 的处理不值得为一条
+      # 十来秒的断言去赌。
+      - name: Repo metadata script
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/e2e-repo-metadata.sh
+
       - name: Stage
         shell: bash
         run: |
