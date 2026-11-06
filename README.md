@@ -634,34 +634,52 @@ cdn:   [0575c61f-...] -> https://ghfast.top/https://github.com/...
 13 = 12 个包 + 1 个遗留前缀键，干净。这条回归已固化为单元测试 `testBdsCdnConfigFile`
 （断言顶层没有 `packs`、没有任何数组值、两种主键都在且值为含加速前缀的完整地址）。
 
-### 11.4 mod 在真实 LLBDS 上加载并写入 BDS 内存
+### 11.4 mod 在真实 LLBDS 上加载、写 BDS 内存，并打通真实 GitHub 闭环
 
-`lip install github.com/LiteLDev/LeviLamina` 环境下，`bedrock_server_mod.exe` 实跑：
+`lip install github.com/LiteLDev/LeviLamina` 环境下，`bedrock_server_mod.exe` 实跑，
+并用一个极小测试包（`packrelay-probe`，3 个文件）跑通了**真实 GitHub 全链路**：
 
 ```
 IFO [LeviLamina] 正在加载 packrelay v1.0.0
 IFO [packrelay] loading packrelay, server root = .
-IFO [packrelay] state loaded: 12 pack(s) from .\.mcpack-sync/state.json
-IFO [packrelay] cdn: restored 12 target(s), redirect -> https://ghfast.top/...
-IFO [packrelay] pipeline: watcher started, interval=0s
-IFO [packrelay] packrelay ready: resourceDir=.\resource_packs, git.enabled=false
+IFO [packrelay] command symbol provider: SymbolProvider (linked via levilamina package)
 IFO [LeviLamina] 已加载 1 个模组
-IFO [packrelay] server ready: pushing cdn urls into BDS memory
-IFO [packrelay] cdn: pushed 12 pack(s) into BDS CDNConfig, mPackCDNUrls now 13 entries
+IFO [packrelay] packrelay console commands registered (/relay, /relaygit)
+IFO [Server] scan requested (async)
+IFO [packrelay] pipeline: 1 pack(s), 3 file(s), 5 KiB
+IFO [packrelay] git: staged 3 file(s) -> packs\packrelay-probe
+IFO [packrelay] git: pushed 18:55:10 to origin/main                    ← 真实 push 到 GitHub
+IFO [packrelay] release packrelay-probe-v1.0.0-fdd289e0 is ready after 1 poll(s)
+IFO [packrelay] cdn: published packrelay-probe ->
+    https://ghfast.top/https://github.com/chm413/test/releases/download/packrelay-probe-v1.0.0-fdd289e0/....zip
+IFO [packrelay] cdn: pushed 1 pack(s) into BDS CDNConfig, mPackCDNUrls now 2 entries
+IFO [packrelay] pipeline: done in 5948ms                               ← 整条链 5.9 秒
+IFO [Server]   c2f55d81-..._1.0.0 -> https://ghfast.top/https://github.com/chm413/test/...
 Quit correctly                      ← exit code 0，无崩溃、无 minidump
 ```
+
+幂等验证（内容不变再扫一次）：
+
+```
+IFO [Server] OK packs=1 files=3 added=0 updated=0 removed=0 unchanged=1
+IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash identical
+                 commit=18:55:10 tag=packrelay-probe-v1.0.0-fdd289e0 cdn=https://ghfast.top/...
+```
+
+下载验证：release zip 直连 200、经 `ghfast.top` 镜像 200，`zipfile.testzip()==None`、PK 头。
 
 也就是说「改磁盘文件不生效、必须写 BDS 内存」这条要求已经真正打通：
 `getServerInstance()` → `ServerInstance::mCDNConfig.get().get()` → `CDNConfig::mPackCDNUrls`
 拿到的是**活对象**，写入即时生效，不需要重启。
 
-同时修掉了三个本轮定位到的缺陷：
+同时修掉了四个本轮定位到的缺陷：
 
 | 缺陷 | 后果 | 根因 |
 |---|---|---|
 | 关闭时崩溃 `0xC0000409` | 每次停服都生成 minidump、被崩溃上报 | `std::thread` 成员仍是 joinable 就进了静态析构 → `std::terminate` → `abort`。崩溃栈：`~McpackSyncMod → std::thread::~thread → ucrtbase(int 0x29)` |
-| 每 8 秒无条件重扫一次 | pack 多时持续吃 CPU | `scanIntervalSeconds: 0` 被 `std::max(5, ...)` 变成 5 秒周期扫描，再叠 3 秒扫描耗时 |
-| `cdn_config.json` 格式错误 | BDS 内存里多出 2 条垃圾键 | 见 11.3 |
+| `git add -A` 在 BDS 内卡满 60s 超时 | 推送链路完全不可用（standalone 0.2s） | 子进程继承了 BDS 的 stdin 管道读端，卡在启动期等待。修复：无输入时把子进程 stdin 指向 NUL 设备 |
+| 插件铺的 `release-packs` workflow 失败 | release 永远建不出来，判据断在「等 release」 | `ci-release.sh` 先 `mkdir ./.releases/<tag>` 再 `cd packs/<slug>` 后用**相对路径** zip——cd 后相对路径解析到包目录里去了。e2e 没抓到是因为 `--fs` 模式传的是绝对路径。修复：cd 前转绝对路径 |
+| `/relay` 永远 `Unknown command` | 控制台指令不可用 | `LoadLibraryW("bedrock_runtime.dll")` 探测永远为空（它不是磁盘文件），命令注册被永久跳过；且手写的 `__pfnDliNotifyHook2` 顶掉了 SymbolProvider。修复：删探测、删手写 hook，无条件注册 + try/catch 兜底 |
 
 ---
 
