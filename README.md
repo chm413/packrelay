@@ -554,6 +554,10 @@ GITHUB_TOKEN=... scripts/sync-repo-metadata.sh   # 应用，幂等，只写真�
 Repository access 要包含本仓库），或 classic PAT 勾 `repo`。权限不够时脚本会直接指出缺哪一项，
 `--dry-run` 也能在没有 token 的情况下先看结果。
 
+**topics 的取值有约束**：GitHub 网页端只能从**已存在**的标签里选，不存在的一律补全成最相近的那个
+（`minecraft-bedrock` 就会被补成 `minecraft-bedrock-modding`，而 `/topics/minecraft-bedrock` 本身是 404）。
+用 API 虽然能凭空建新标签，但没人会点开一个零索引的标签，所以 conf 里只放生态中真实流通的名字。
+
 `--check` 可以挂进 CI 当门禁，但要为此在 secret 里放一个高权限 token——为两行元数据不值当，
 默认没有接。
 
@@ -780,6 +784,6 @@ IFO [Server]   - [unchanged] packrelay-probe ok : uuid+version+fileSetHash ident
    `packrelay scan|once`。
 6. 单进程单实例：`.mcpack-sync/` 目录未加文件锁，同一服务器根目录不要同时跑两个 `packrelay`。
 7. **仓库 description / topics 不受版本控制**：见 §9.3。写它们要 Administration:write，
-   `git push` 用的是 contents:write，两套权限不通用，自动化流水线也带不动它。
+   `git push` 用的是 contents:write，两套权限不通用，流水线也带不动它。
    内容已声明在 `scripts/repo-metadata.conf`，用 `scripts/sync-repo-metadata.sh` 幂等应用；
-   没有对应权限的 token 时，这一项只能停在"配置就绪、等待一次授权"的状态。
+   `--check` 可以对线上做只读比对，用于确认"声明"和"实际"没有漂移。
