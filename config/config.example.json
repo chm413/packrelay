@@ -1,0 +1,102 @@
+{
+  "version": 1,
+
+  "resourceDir": "resource_packs",
+
+  "server": {
+    "scanIntervalSeconds": 60,
+    "scanOnStart": true,
+    "scanOnWorldLoad": false,
+    "debounceMs": 2000,
+    "shutdownTimeoutMs": 10000
+  },
+
+  "identity": {
+    "requireManifest": true,
+    "conflictPolicy": "highest_version",
+    "matchModuleUuid": true,
+    "ignorePatterns": ["**/.DS_Store", "**/Thumbs.db", "**/*.tmp", "**/~$*", "**/*.zip"]
+  },
+
+  "git": {
+    "enabled": true,
+    "workDir": ".mcpack-sync/repo",
+    "remote": "https://github.com/OWNER/REPO.git",
+    "branch": "main",
+    "authMode": "token_env",
+    "tokenEnv": "MCPACK_GIT_TOKEN",
+    "token": "",
+    "username": "",
+    "password": "",
+    "sshKey": "",
+    "sshKeyEnv": "MCPACK_GIT_SSH_KEY",
+    "authorName": "packrelay",
+    "authorEmail": "packrelay@localhost",
+    "commitTemplate": "chore(pack): {name} v{version} [{uuid8}]",
+    "pushRetries": 3,
+    "retryBackoffMs": 2000,
+    "timeoutMs": 180000,
+    "subDir": "packs",
+    "extraArgs": []
+  },
+
+  "release": {
+    "waitForRelease": true,
+    "pollIntervalMs": 3000,
+    "pollTimeoutMs": 300000,
+    "tagTemplate": "{slug}-v{version}-{hash8}",
+    "assetNameTemplate": "{slug}-v{version}-{hash8}.zip",
+    "assetSuffix": ".zip",
+    "requireAsset": true
+  },
+
+  "github": {
+    "apiBase": "https://api.github.com",
+    "owner": "OWNER",
+    "repo": "REPO",
+    "tokenEnv": "MCPACK_GH_TOKEN",
+    "userAgent": "packrelay/1.0",
+    "proxy": "",
+    "timeoutMs": 30000,
+    "maxRetries": 3
+  },
+
+  "cdn": {
+    "enabled": true,
+    "mode": "release_asset",
+    "publicBaseUrl": "",
+    "staticUrl": "",
+    "activeMirror": "auto",
+    "writeManifest": true,
+    "manifestFile": ".mcpack-sync/cdn.json",
+    "mirrors": [
+      { "name": "direct",   "enabled": true,  "priority": 0,  "template": "{url}" },
+      { "name": "ghfast",   "enabled": true,  "priority": 10, "prefix": "https://ghfast.top/" },
+      { "name": "gh-proxy", "enabled": false, "priority": 20, "prefix": "https://gh-proxy.com/" },
+      { "name": "jsdelivr", "enabled": false, "priority": 30, "template": "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{tag}/{path}" }
+    ],
+    "serverProperties": {
+      "enabled": false,
+      "file": "server.properties",
+      "key": "mcpack-cdn-url"
+    },
+    "bdsCdnConfig": {
+      "enabled": true,
+      "file": "cdn_config.json",
+      "key": "CDN URL"
+    },
+    "redirectServer": {
+      "enabled": false,
+      "bind": "0.0.0.0",
+      "port": 19134,
+      "path": "/pack"
+    }
+  },
+
+  "log": {
+    "level": "info",
+    "file": "logs/packrelay.log",
+    "maxSizeMB": 8,
+    "rotate": 3
+  }
+}

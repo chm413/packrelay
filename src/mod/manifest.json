@@ -1,0 +1,8 @@
+{
+  "entry": "packrelay.mod.dll",
+  "name": "packrelay",
+  "type": "native",
+  "version": "1.0.0",
+  "author": "packrelay",
+  "description": "Auto-maintain and distribute non-vanilla resource packs: scan -> diff by uuid/version/hash -> git push -> GitHub Release -> CDN url relay."
+}

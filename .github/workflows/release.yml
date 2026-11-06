@@ -1,0 +1,68 @@
+name: release
+
+# 打 tag（v1.0.0 形式）即发布。
+# 构建流程直接复用 build.yml，保证「发布出去的东西」和「CI 验证过的东西」完全一致。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已有 tag（如 v1.0.0）"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Resolve tag and asset names
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          mkdir -p assets
+          for z in dist/packrelay-*.zip; do
+            base=$(basename "$z" .zip)
+            # packrelay-mod-win-x64 -> packrelay-<tag>-mod-win-x64
+            name="${base/packrelay-/packrelay-${tag}-}"
+            cp "$z" "assets/${name}.zip"
+          done
+          ls -l assets
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists, uploading assets"
+            gh release upload "$TAG" assets/*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            # 不用 --notes-start-tag：本 job 没 checkout，拿不到上一个 tag；--generate-notes 足够
+            gh release create "$TAG" assets/*.zip \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag
+          fi

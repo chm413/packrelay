@@ -1,0 +1,34 @@
+# ---- 构建产物 ----
+build/
+build-*/
+out/
+pkg/
+artifacts/
+.xmake/
+.cache/
+
+# ---- MSVC / 链接中间物 ----
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+vc140.pdb
+
+# ---- 运行期状态（含 state.json 包指纹，绝不能提交） ----
+.mcpack-sync/
+e2e/
+*.log
+logs/
+*.zip
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
+
+# 示例配置要保留，其余 json 视情况
+!config/*.json

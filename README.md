@@ -1,0 +1,711 @@
+# packrelay
+
+面向 **LeviLamina（BDS）** 的非原版资源包自动维护与分发插件（C++20）。
+
+扫描本地资源目录 → 按 `uuid + 版本 + 全量文件哈希` 精确判定变更 → 自动 git push 到指定仓库 →
+仓库预置的 GitHub Actions 识别变更、打包 zip、创建 Release → 插件把 CDN 地址切到最新 Release。
+
+- `packrelay` —— 可独立运行的引擎（守护进程 / CLI），零第三方依赖
+- `packrelay.mod.dll` —— LeviLamina 适配层，只做接线，业务逻辑全在 core
+- `.github/workflows/release.yml` + `scripts/ci-release.sh` —— 插件自动铺进目标仓库的发布流水线
+
+> **命名约定**：对外名称统一 `packrelay`（mod id、DLL 名、CLI 名、指令前缀、日志前缀）。
+> 内部标识保留 `mcpsync`（C++ namespace、`include/mcpsync/`、`mcpsync_core` 静态库、源码目录 `mcpack-sync/`），
+> 以及状态目录 `.mcpack-sync/`——改它会让已有部署的 `state.json` 失效、全部资源包当作新增重传一遍。
+
+---
+
+## 1. 整体架构
+
+```
+┌──────────────────────────── BDS / bedrock_server_mod.exe ────────────────────────────┐
+│  PreLoader → LeviLamina (mod loader)                                                 │
+│      └── mods/packrelay/packrelay.mod.dll           ← 适配层（MSVC 构建）             │
+│              │  读取 mods/packrelay/config/config.json                              │
+│              │  订阅 ServerStartedEvent / ServerStoppingEvent                         │
+│              │  注册 /relay (status|scan|cdn|push|dump|reload) 与 /relaygit          │
+│              ▼                                                                        │
+│      mcpsync_core（静态库，纯 C++20）                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼────────────────────────────┐
+        ▼                           ▼                            ▼
+  ①扫描/比对                   ②推送                        ③④发布与分发
+  resource_packs/          git push → GitHub            Releases API / 镜像
+  manifest.json            (index.json + packs/)         → CDN 三层 sink
+```
+
+数据流：
+
+| 阶段 | 动作 | 关键产物 |
+|---|---|---|
+| Scan | 递归找出所有含 `manifest.json` 的目录，逐文件 SHA-256 | `PackSnapshot` |
+| Diff | 与 `.mcpack-sync/state.json` 比对 uuid / version / fileSetHash | `Change{Added,Updated,Removed,Unchanged}` |
+| Publish | 镜像到仓库 `packs/<slug>/`，写 `index.json`，commit + push | commit sha |
+| Release | 轮询 `GET /repos/{o}/{r}/releases/tags/{tag}` | 资产 URL |
+| Distribute | 解析镜像 → 更新 CDN sink | `cdn.json` / `cdn_config.json` / 302 目标 |
+
+---
+
+## 2. 关键模块划分
+
+| 模块 | 文件 | 职责 |
+|---|---|---|
+| M0 基础 | `src/core/{json,sha256,fsutil,logger,model}.cpp` | 零依赖 JSON（保序）、SHA-256、UTF-8 路径与原子写、分级日志 |
+| M1 配置 | `src/core/config.cpp` | JSON→`Config`、默认值、`baseDir` 解析、`validateConfig` |
+| M2 扫描 | `src/core/scanner.cpp` | manifest 解析、全量文件指纹、`fileSetHash`、同 uuid 冲突检测 |
+| M3 状态 | `src/core/state.cpp` | `.mcpack-sync/state.json`，原子写、损坏备份重建 |
+| M4 比对 | `src/core/diff.cpp` | 三要素判定、`fingerprint = sha256(uuid\|version\|fileSetHash)` |
+| M5 进程 | `src/net/process.cpp` | `CreateProcessW` + 管道并发读取 + 超时强杀，CRT 引号规则 |
+| M6 网络 | `src/net/{http,github,mirror}.cpp` | WinHTTP（代理/超时/重试）、Releases API、镜像模板渲染 |
+| M7 Git | `src/ops/git.cpp` | 幂等提交、token 注入、非快进自动 rebase、仓库模板落地 |
+| M8 分发 | `src/ops/cdn.cpp` | `cdn.json` / `server.properties` / `cdn_config.json` / 302 重定向服务 |
+| M9 编排 | `src/ops/pipeline.cpp` | 单次/周期执行、失败续跑、并发互斥、报告 |
+| M10 打包 | `src/ops/zip.cpp` | 自带 store 模式 ZIP 写入（少量环境无 `zip` 命令） |
+| M11 适配 | `src/mod/levilamina_mod.cpp` | LL 生命周期/事件/命令/日志接线 |
+
+---
+
+## 3. 精确比对：如何做到「不误判、不重复上传、不遗漏更新」
+
+**身份**：`header.uuid`（小写归一化）为主键；`modules[type=="resources"].uuid` 作为辅助。
+uuid 相同即同一资源包，与目录名、路径、改名完全无关。
+
+**指纹**（三重）：
+
+```
+fileSetHash  = SHA-256( ⋃ sorted("relpath\0sha256\n") )     // 全量文件，与 mtime 无关
+fingerprint  = SHA-256( uuid + "|" + "1.0.3" + "|" + fileSetHash )
+```
+
+**判定矩阵**：
+
+| 历史 state | uuid | version | fileSetHash | 结论 |
+|---|---|---|---|---|
+| 无 | — | — | — | `Added` |
+| 有 | 同 | 同 | 同 | `Unchanged`（不提交、不推送） |
+| 有 | 同 | 变 | 任意 | `Updated` |
+| 有 | 同 | 同 | **变** | `Updated`（防"只改内容不改版本"的漏更） |
+| 有 | 消失 | — | — | `Removed`（`git rm` 目录） |
+
+三条工程约束：
+
+1. **不依赖 mtime / 文件大小**——打包工具、rsync、git clone 都会改写时间戳，只认内容哈希。
+2. **推送成功即落状态**（`state.pushed.commit` + `releasePending=true`）；若后续 release 阶段失败，
+   下次运行只补发布阶段，**绝不重复提交**。状态文件 `.tmp` + `MoveFileEx(REPLACE_EXISTING)` 原子替换，
+   损坏时自动备份为 `state.json.corrupt.<ts>` 并重建，避免"永远认为已是最新"。
+3. **同 uuid 多目录冲突**：`identity.conflictPolicy = highest_version | error | newest_mtime`，
+   默认保留高版本，冲突写进报告与日志（BDS 自带 `vanilla`/`vanilla_1.21.x` 就是同 uuid 多目录）。
+
+实测：BDS 1.26.60 自带 `resource_packs/` 共 67 个 manifest → 归并为 12 个唯一 uuid，
+报告 55 条冲突并被策略正确收敛。
+
+---
+
+## 4. 配置项设计
+
+配置文件：`<serverRoot>/config/packrelay/config.json`（mod 场景亦可用 `mods/packrelay/config/config.json`）。
+所有相对路径以 `baseDir` 为基准（`baseDir` 缺省为配置文件所在目录，可由 JSON 字段覆盖；
+mod 场景固定为服务器根目录，保证升级重装后状态不漂移）。
+
+| 段 | 键 | 说明 |
+|---|---|---|
+| 根 | `resourceDir` | 资源根目录，递归查找 `manifest.json` |
+| | `baseDir` | 相对路径基准 |
+| `server` | `scanIntervalSeconds` | 周期扫描间隔 |
+| | `scanOnStart` / `scanOnWorldLoad` | 启动 / 世界加载时触发 |
+| | `debounceMs` | 事件触发去抖，避免连续写盘打爆扫描 |
+| `identity` | `conflictPolicy` | 同 uuid 多目录策略 |
+| | `ignorePatterns` | 通配（`**`、`*`、`?`，大小写不敏感） |
+| | `matchModuleUuid` | 是否同时校验 resources 模块 uuid |
+| `git` | `remote` / `branch` / `subDir` | 目标仓库与包存放子目录 |
+| | `authMode` | `token_env`（默认）/ `token_inline` / `credential_helper` / `ssh` |
+| | `tokenEnv` / `token` | 模式一读环境变量，模式二读明文 `token`（控制台写入） |
+| | `username` / `password` | HTTPS 基本认证；不给 `username` 时默认 `x-access-token` |
+| | `sshKey` / `sshKeyEnv` | SSH 私钥路径，走 `core.sshCommand` 注入 |
+| | `pushRetries` / `retryBackoffMs` / `timeoutMs` | 推送退避与超时 |
+| | `commitTemplate` | `{name} {version} {uuid8} {slug} {files}` |
+| `release` | `tagTemplate` | 默认 `{slug}-v{version}-{hash8}`，**由插件预渲染进 index.json** |
+| | `assetNameTemplate` / `assetSuffix` | 资产名与匹配后缀 |
+| | `waitForRelease` / `pollIntervalMs` / `pollTimeoutMs` | 轮询策略；`waitForRelease=false` 时用 URL 规则推导 |
+| `github` | `apiBase` / `owner` / `repo` | 可在 GitHub Enterprise / 本地 mock 间切换 |
+| | `tokenEnv` / `proxy` / `timeoutMs` / `maxRetries` | 认证、代理、重试 |
+| `cdn` | `mode` | `release_asset` / `mirror_template` / `static` |
+| | `mirrors[]` | `{name, enabled, priority, prefix}` 或 `{..., template}`，两种写法见下节 |
+| | `activeMirror` | `auto`（按 priority 取最高）或镜像名，如 `"ghfast"` |
+| | `writeManifest` / `manifestFile` | 写 `.mcpack-sync/cdn.json` 供外部分发层消费 |
+| | `bdsCdnConfig` | 写 BDS 官方 `cdn_config.json`，每包完整下载地址（`key` 默认 `"CDN URL"`） |
+| | `serverProperties` | 可选，把地址写进 `server.properties` 自定义键 |
+| | `redirectServer` | 可选内嵌 302 服务（默认关闭）：`bind/port/path`，对外地址恒定、目标热切换 |
+| `log` | `level` / `file` / `maxSizeMB` / `rotate` | 分级 + 按大小轮转 |
+
+完整示例见 [`config/config.example.json`](config/config.example.json)。敏感项全部走环境变量
+（`MCPACK_GIT_TOKEN` / `MCPACK_GH_TOKEN` / `MCPACK_GH_OWNER` / `MCPACK_GH_REPO`），配置文件可入库。
+
+### 下载地址拼接
+
+GitHub 托管模式下，资源包的下载地址就是拼出来的字符串，插件负责拼完整：
+
+```
+基线（直连）
+  https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}
+
+加 gh 加速（前缀直接拼在基线前面，不做 URL 编码）
+  https://ghfast.top/https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}
+```
+
+实跑示例（`owner=chm413`、`repo=mcpack`）：
+
+```jsonc
+// cdn_config.json
+{
+  "CDN URL": "https://ghfast.top/",
+  "packs": [{
+    "uuid": "11111111-...",
+    "url":       "https://ghfast.top/https://github.com/chm413/mcpack/releases/download/demo-pack-v1.0.0-4c375dbc/demo-pack-v1.0.0-4c375dbc.zip",
+    "directUrl": "https://github.com/chm413/mcpack/releases/download/demo-pack-v1.0.0-4c375dbc/demo-pack-v1.0.0-4c375dbc.zip",
+    "mirrors": [ { "mirror": "direct", "url": "..." }, { "mirror": "ghfast", "url": "..." } ]
+  }]
+}
+```
+
+`url` 永远是可直接下载的完整地址；`mirrors` 给出全部备选，客户端或运维可自行降级。
+
+### 加速镜像
+
+`cdn.mirrors` 支持两种写法，按 `priority` 升序生效：
+
+| 写法 | 字段 | 说明 |
+|---|---|---|
+| 前缀式 | `prefix` | 把完整地址直接拼在加速域名后，**推荐**（ghfast / gh-proxy 都属于这类） |
+| 模板式 | `template` | 更灵活，可用 `{url}` `{url_enc}` `{owner}` `{repo}` `{tag}` `{asset}` `{path}` |
+
+```json
+"mirrors": [
+  { "name": "direct",   "enabled": true,  "priority": 0,  "template": "{url}" },
+  { "name": "ghfast",   "enabled": true,  "priority": 10, "prefix": "https://ghfast.top/" },
+  { "name": "gh-proxy", "enabled": false, "priority": 20, "prefix": "https://gh-proxy.com/" },
+  { "name": "jsdelivr", "enabled": false, "priority": 30, "template": "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{tag}/{path}" }
+]
+```
+
+`activeMirror` 三种取值：
+
+- `"auto"`（默认）— 取优先级最高的启用项，即上面的 `direct`，下发直连地址
+- `"ghfast"` — 强制走 ghfast 加速，下发的每条地址都带 `https://ghfast.top/` 前缀
+- 其他镜像名 — 同理；名字不存在时自动退回 `auto`，不会导致发布失败
+
+前缀尾部斜杠会自动收敛成单个 `/`，`https://ghfast.top`、`https://ghfast.top//` 都等价于 `https://ghfast.top/`。
+
+### 让 BDS 真正生效：写内存，而不是只改文件
+
+`CDNConfig` 只在 `ServerInstance` 构造时读一次 `cdn_config.json`，**LeviLamina 加载之后再改磁盘文件不会触发重读**，
+所以纯文件路线只能等重启才生效。插件因此走 LeviLamina 的服务访问器直接写内存：
+
+| 步骤 | 调用 |
+|---|---|
+| 拿服务端实例 | `ll::service::bedrock::getServerInstance()` |
+| 取 CDN 配置 | `ServerInstance::mCDNConfig`（public 成员，`Bedrock::NonOwnerPointer<CDNConfig>`） |
+| 取映射表 | `CDNConfig::mPackCDNUrls`（`std::vector<std::pair<packId, url>>`） |
+| 写映射 | `mcpsync::upsertPackCdnUrls()` —— 就地 upsert，保留运维手工加的条目 |
+| 切线程 | `ServerInstance::queueForServerThread()`，保证在服务器线程碰 BDS 对象 |
+
+```cpp
+auto inst        = ll::service::bedrock::getServerInstance();
+::CDNConfig* cfg = inst->mCDNConfig.get().get();   // 持有者失效时返回 nullptr，必须判空
+auto& urls       = cfg->mPackCDNUrls.get();         // vector<pair<string,string>>&
+mcpsync::upsertPackCdnUrls(urls, entries);          // entries 来自 cdn.json 的 packCdnUrls
+```
+
+主键同时写 `<uuid>_<version>` 和裸 `<uuid>` 两种，兼容不同版本的查找方式；写之前会清掉同 uuid 的**历史版本主键**，
+否则版本升级后旧键残留，BDS 仍可能取到过期外链。
+
+生效时机：
+
+| 时机 | 触发 |
+|---|---|
+| 服务器启动 | `ServerStartedEvent` 用上次落盘的 `cdn.json` 补一遍（重启后内存是空的） |
+| 每次发布 | `Pipeline::onCdnPublished` 回调，自动推送，**无需重启** |
+| 手动 | `/relay push` |
+
+排查：`/relay dump` 打印 BDS 内存里现有的 `packId -> url`，用来核对主键格式；`/relay cdn` 列出清单侧的目标。
+
+---
+
+## 5. 异常处理策略
+
+| 层 | 策略 |
+|---|---|
+| 调用约定 | core 内部一律 `Result<T>/Status` + `ErrCode`，**不跨 DLL 边界抛异常**；mod 适配层对 LL 回调做 try/catch 兜底 |
+| 配置 | 缺失必填项时 mod **不阻塞服务器启动**，自动降级为"仅扫描"并 WARN |
+| 状态 | 原子写（`.tmp` → `MoveFileEx`）；解析失败备份 `.corrupt.<ts>` 后重建 |
+| 扫描 | 单个包 manifest 非法 → 记 warning 并跳过，不中断整轮；同 uuid 冲突按策略收敛 |
+| Git | 认证失败（`Authentication failed` / `could not read Username`）**立即停止重试**并给出修复提示；非快进 → `pull --rebase --autostash` 重试一次；网络类错误指数退避 |
+| 网络 | 连接/发送/接收分设超时；仅对 5xx 与网络错误重试（4xx 直接失败）；`404` 在 release 轮询中视为"尚未就绪"继续等 |
+| Release | 超时后保留 `releasePending=true`，下次运行只补发布阶段；`waitForRelease=false` 时用 `releases/download/{tag}/{asset}` 规则推导，避免 API 限流阻断发布 |
+| 幂等 | `git status --porcelain` 为空 → 跳过提交；同内容重复运行不产生新 commit（E2E 已验证远端 HEAD 不变） |
+| 并发 | 流水线内 `std::mutex` 串行化；mod 侧事件只投递 `requestScan()`，不阻塞 tick；停止时 `stopWatcher()` + `join` |
+| Git 子进程 | `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never`，防止服务端卡在交互式凭据输入 |
+
+---
+
+## 6. 实现思路要点
+
+**推送**：token 不写进 remote URL，改用 `-c http.extraheader="AUTHORIZATION: basic base64(x-access-token:TOKEN)"`，
+避免泄漏到 `.git/config` 与 reflog。参数按 CRT 引号规则拼装后直接 `CreateProcessW`，不经 shell，杜绝注入。
+
+**仓库预置**：`GitPublisher::prepare()` 首次运行时把 `release.yml` / `ci-release.sh` / `README.md`
+写入目标仓库并随包一起提交——"仓库预置 workflow"不依赖人工操作，且模板版本跟随插件版本。
+
+**tag 单一事实源**：插件在写 `index.json` 前就渲染好 `tag` 与 `assetName` 并写入索引；
+Actions 端**不做任何命名推断**，直接读 `index.json`。插件取回 release 用的也是同一个 tag，两端永不漂移。
+tag 含 `{hash8}`（指纹前 8 位），因此"内容变了但没改版本号"也能产生唯一 tag，不会撞车。
+
+**CDN 分发（地址是拼出来的，不是查出来的）**
+
+GitHub 托管模式下没有"注册下载地址"的接口，**下载地址完全由 `owner/repo/tag/asset` 拼接得到**：
+
+```
+https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}
+```
+
+需要加速就在前面加前缀（ghfast 属于前缀式加速，不对 URL 做编码）：
+
+```
+https://ghfast.top/https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}
+```
+
+因此"始终指向最新 release"= 每次发布把 tag/asset 换成新的，重新拼一遍地址。落地为四层 sink，可任意组合：
+
+1. **BDS 内存映射** —— 通过 LL 接口写 `CDNConfig::mPackCDNUrls`，热生效，见上节（主路径）；
+2. `cdn.json` —— 机器可读清单，含 `assetUrl`（直连）/ `publicUrl`（当前生效，含加速）/ `candidates`（全部备选）
+   以及扁平映射 `packCdnUrls[]`（`packId` / `uuid` / `version` / `url` / `directUrl`）；
+3. `cdn_config.json` —— BDS 磁盘配置，每包写**完整可下载地址** `url` + `directUrl` + `mirrors[]`，供重启后兜底；
+4. 内嵌 302 服务（可选，默认关闭）—— 对外暴露恒定地址如 `http://host:19134/pack`，每次发布只换 `Location`。
+
+服务重启时 `CdnManager::init()` 会从 `cdn.json` 恢复目标，**未完成首轮扫描也不会回退到空地址**。
+
+---
+
+## 7. 控制台指令
+
+两条根命令，权限刻意分开：
+
+| 根命令 | 权限 | 用途 |
+|---|---|---|
+| `/relay` | `GameDirectors` | 运维查询与手动触发，游戏内管理员可用 |
+| `/relaygit` | `Host` | git 凭据管理，**仅服务器控制台**，游戏内不可用 |
+
+`/relaygit` 单独一条根命令就是为了守住这条边界：改令牌不能由游戏内管理员操作。
+
+服务器控制台（或管理员）直接管理 git 凭据，**所有修改立即写回 `config.json` 并重建流水线**，无需重启。
+
+| 指令 | 说明 |
+|---|---|
+| `/relaygit` | 查看当前 git 配置，敏感项脱敏（`ghp_****2345`） |
+| `/relaygit remote <url>` | 设置远端，接受 `https://` 或 `git@` 形式 |
+| `/relaygit branch <name>` | 设置分支 |
+| `/relaygit user <name> <email>` | 设置提交作者 |
+| `/relaygit token <PAT>` | 设置令牌，**自动切到 `token_inline`** |
+| `/relaygit password <user> <pass>` | 设置 HTTPS 用户名密码 |
+| `/relaygit sshkey <path>` | 设置 SSH 私钥，**自动切到 `ssh`** |
+| `/relaygit mode <mode>` | `token_env` / `token_inline` / `credential_helper` / `ssh` |
+| `/relaygit clear` | 清除 token/password/sshKey，`authMode` 收回 `token_env` |
+| `/relaygit test` | 连通性测试（`git ls-remote --heads`，最长 20s） |
+
+其余运维指令（都挂在 `/relay` 下）：
+
+| 指令 | 说明 |
+|---|---|
+| `/relay` | 等价于 `/relay status`，少敲一层 |
+| `/relay status` | 最近一次流水线结果 + 各包当前外链 |
+| `/relay scan` | 立即触发一次扫描（异步） |
+| `/relay cdn` | 列清单侧的包与外链 |
+| `/relay push` | 把外链推入 BDS 内存（热生效） |
+| `/relay dump` | 打印 BDS 内存中现有的 `packId -> url` |
+| `/relay reload` | 重新读取 `config.json` |
+
+`/relaygit test` 的失败诊断直接给可操作建议，例如实测输出：
+
+```
+> /relaygit test
+  probing https://github.com/chm413/mcpack.git (auth=token_inline) ...
+  failed: exit=128 elapsed=3787ms
+  git: remote: Invalid username or token. ...
+  → 凭据无效或缺失：用 /relaygit token <PAT> 设置令牌，或 /relaygit password <user> <pass>
+```
+
+覆盖的诊断分支：凭据无效、SSH 公钥被拒、host key 未受信、仓库不存在/无权限、网络不可达、工作目录非 git 仓库。
+
+> **凭据落盘是明文的。** `/relaygit token|password|sshkey` 会把值原样写进 `config.json`（用户要求"自动保存"）。
+> 因此：
+> - 服务器上的 `config.json` 建议 `chmod 600` / 加 NTFS ACL，不要提交进版本库；
+> - 更安全的做法是保持 `authMode=token_env`，把令牌放环境变量，凭据不落盘；
+> - 回显一律脱敏（`ghp_****2345`），但**日志里也不会打印明文**，只在写盘时出现一次。
+
+### CLI 等价命令
+
+同样的能力在 `packrelay` CLI 上也可用（便于在服务器外用同一份配置排错），参数与行为完全一致：
+
+```bash
+packrelay git                                  # 查看
+packrelay git remote https://github.com/chm413/mcpack.git
+packrelay git user chm413 chm413@users.noreply.github.com
+packrelay git token ghp_xxx
+packrelay git sshkey C:/Users/me/.ssh/id_ed25519
+packrelay git test
+packrelay git clear
+packrelay cdn                                  # 列出发布记录与外链
+packrelay cdn render --dir <服务器根>          # 按 cdn.json 重写 cdn_config.json / server.properties
+```
+
+两者共用 `src/core/gitauth.cpp`：`resolveGitToken` / `buildAuthArgs` / `probeGitRemote` / `applyGitField` / `patchConfigFileGit`。
+
+> **注意**：这些控制台指令依赖加载器提供 `bedrock_runtime.dll`（BDS 命令 API 的导入目标）。
+> 该模块缺失时插件会自动跳过命令注册并告警，其余功能不受影响 —— 详见 §12 第 5 条。
+> 上面这套 CLI 命令在任何环境下都可用，且用的是同一份配置文件。
+
+---
+
+## 8. 目录结构
+
+```
+mcpack-sync/
+├── CMakeLists.txt
+├── include/mcpsync/*.hpp
+├── src/core/    json sha256 fsutil logger model config scanner state diff gitauth
+├── src/net/     process http github mirror
+├── src/ops/     git cdn zip repo_template pipeline
+├── src/cli/     main.cpp            # scan | once | watch | redirect | package | dump-state | init-config | git | cdn
+├── src/mod/     levilamina_mod.cpp  # LL 适配层（需 MSVC）
+│                manifest.json
+├── config/config.example.json
+├── scripts/     e2e.mjs  mock-gh-server.mjs
+└── tests/test_main.cpp
+```
+
+---
+
+## 9. 构建
+
+```bash
+# 依赖：CMake >= 3.20 + C++20 编译器（MSVC 2019+ / GCC 13+ / Clang 16+）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/mcpsync-tests        # 单元测试
+```
+
+本机实测工具链：**g++ 15.2.0 (MinGW-w64 UCRT, x86_64)**，CMake 4.2.1。
+
+LeviLamina mod 目标（`MCPSYNC_BUILD_MOD=ON`）**必须用 MSVC**：
+
+```bat
+cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64 ^
+      -DMCPSYNC_BUILD_MOD=ON -DLL_SDK_DIR=<LeviLamina SDK>
+cmake --build build-msvc --config Release
+```
+
+> 原因（已实测）：`LeviLamina.dll` 导出的是 MSVC 修饰名，例如
+> `?getModDir@Mod@mod@ll@@QEAAAEBVpath@filesystem@std@@XZ`。MinGW 的 Itanium ABI 无法解析，
+> 链接必然失败。这不是项目选择，是 LLBDS 生态的硬约束。
+
+### 9.1 不用 xmake 的 MSVC 直编链路（本机实测可用）
+
+LeviLamina 官方模板用 `xmake` + `@levibuildscript/linkrule`。在只装了 MSVC、没有完整
+xmake 包管理环境时（本机实测：xmake 拉第三方包全部 `LINK failed (exit code 1104)`），
+可以完全绕过 xmake，手工复刻 linkrule 做的事。整条链路只有 4 步：
+
+**① 编译所有 TU（`/MD /std:c++20`，注意必须 `/DLL_PLAT_S`）**
+
+```bat
+cl /nologo /c /std:c++20 /EHsc /MD /utf-8 /W3 /Zi /FS ^
+   /DLL_PLAT_S /DNOMINMAX /DUNICODE /D_WIN32_WINNT=0x0A00 ^
+   /Iinclude /I<LL>/src /I<LL>/src-server /I<3rd>/include ^
+   src\core\*.cpp src\net\*.cpp src\ops\*.cpp src\mod\*.cpp
+```
+
+**② prelink：从 `bedrock_runtime_data` 反查未定义符号，生成导入库**
+
+```
+prelink.exe server-windows-x64 <outdir> <bedrock_runtime_data> <obj1> <obj2> ...
+```
+
+参数顺序**必须**是 `prelink <target_type>-<plat>-<arch> <outdir> <data> <inputs...>`，
+且 `<outdir>/lib/` 必须**预先存在**，否则报 `Cannot create bedrock_runtime_api.lib`。
+
+**③ 链接**
+
+```bat
+cl /nologo /LD /MD <objs> /Fe:packrelay.dll /link /DLL /DEBUG /INCREMENTAL:NO ^
+   /LIBPATH:<outdir>\lib /LIBPATH:<LL>\lib ^
+   LeviLamina.lib bedrock_runtime_api.lib ^
+   /DELAYLOAD:bedrock_runtime.dll delayimp.lib ^
+   winhttp.lib ws2_32.lib user32.lib advapi32.lib shell32.lib ole32.lib crypt32.lib dbghelp.lib
+```
+
+**④ 必须有一个 TU 覆盖内存分配运算符**
+
+LeviLamina 加载 native mod 时会检查导出符号 `ll_memory_operator_overrided`，
+缺失就直接拒绝加载（"未使用统一的内存分配运算符"）。所以要有且只有一个 TU：
+
+```cpp
+// src/mod/memory_operators.cpp
+#define LL_MEMORY_OPERATORS
+#include "ll/api/memory/MemoryOperators.h"
+```
+
+本机踩过的额外坑，一并记在这里：
+
+| 现象 | 根因 | 处理 |
+|---|---|---|
+| `make_unexpected: 应输入 1 个参数，却提供了 2 个`（`ll/api/Expected.h:53`） | expected-lite v0.8.0 没有 `make_unexpected(in_place, ...)` 重载 | 升到 **v0.10.0** |
+| `fmt::v11::vformat` 未解析 | `Logger::log<T>` 模板会实例化非内联的 `vformat` | 额外编译 `fmt/src/format.cc` 与 `os.cc` |
+| `ServerInstance::queueForServerThread` 未解析 | 该 API 已标 `MCNAPI`（deprecated），BDS 1.26.60 的 runtime data 里无此符号 | 改用 `ll::thread::ServerThreadExecutor::getDefault().execute(...)` |
+| `CommandOutput::success` / `CommandRegistry::parse` 未解析 | 这些符号既不在 `LeviLamina.dll`，也不在 `bedrock_server.exe` | 由 prelink 的 `bedrock_runtime_api.lib` 提供 |
+| `vcvars64.bat` 跑完 `WindowsSDKVersion` 为空 → `rc.exe`/`mt.exe` NOTFOUND | 它内部调 `reg.exe`，被沙箱拦截 | 不用 vcvars，直接 export `INCLUDE`/`LIB`/`PATH` |
+| `D:\git\...` 被改写成 `D:\d\git\...`、`/nologo` 被当成路径 | MSYS2 参数转换 | `export MSYS2_ARG_CONV_EXCL='*'` |
+
+**`manifest.json` 的三个硬性约束**（写错就加载不上，且报错信息不直白）：
+
+| 字段 | 必须 | 写错的报错 |
+|---|---|---|
+| `type` | `"native"`（`NativeModManagerName`） | `无法识别的模组类型：mod` |
+| `entry` | 与实际 DLL 文件名完全一致 | 静默不加载 |
+| `dependencies` | 若要写必须是数组 `[{"name":"LeviLamina","version":">=26.0.0"}]`；简化起见建议整段省略 | `field must be an array` / `dependency LeviLamina is missing` |
+
+### 9.2 CI：编译 / 打包 / 发布
+
+两个 workflow，职责分开，`release.yml` 直接复用 `build.yml`，保证「发布出去的产物」就是「CI 验证过的产物」。
+
+| 文件 | 触发 | 干什么 |
+|---|---|---|
+| `.github/workflows/build.yml` | push 到 main、PR、手动 | 三块并行：`core`（Windows+Linux 编译 CLI 与单测并 ctest）、`mod`（Windows+MSVC 编 DLL）、`dist`（汇总打 zip） |
+| `.github/workflows/release.yml` | 打 `v*` tag、手动指定 tag | `workflow_call` 调 build.yml → 下载 dist 产物 → `gh release create` |
+
+**产物结构**（三个 zip）：
+
+```
+packrelay-<tag>-mod-win-x64.zip     解压 = packrelay/，整个目录丢进 mods/ 即用
+  └── packrelay/{manifest.json, packrelay.mod.dll, packrelay.pdb}
+packrelay-<tag>-cli-win-x64.zip     packrelay.exe
+packrelay-<tag>-cli-linux-x64.zip   packrelay
+```
+
+**两条构建路径为什么不同**：
+
+- `core` 用 **CMake**：零第三方依赖，Windows / Linux 都能编，跑 ctest。
+- `mod` 用 **xmake**：mod 必须用 MSVC 且要链接 `LeviLamina.lib`，头文件树里有 entt/gsl/glm/leveldb/rapidjson 等十几个依赖，还有 `prelink.exe` + `bedrock_runtime_data`。
+  这些由 levimc-repo 的 `levilamina 26.60.2` 包 + `levibuildscript` + `symbolprovider` 一次性解析，手工拼不现实。
+
+> CI 里 xmake 首次会**现场编译 LeviLamina**（约 15–25 分钟），所以 workflow 里缓存了 `C:\xmake\packages`，
+> 二次构建降到 2 分钟左右。缓存 key 带 `hashFiles('xmake.lua')`，改构建脚本会自动失效。
+>
+> xmake 产出的 DLL 名是 `packrelay.dll`，而 `manifest.json` 的 `entry` 要求 `packrelay.mod.dll`，
+> 所以 stage 步骤里做了重命名——这一步错了 LL 会**静默不加载**，属于易错点。
+
+发布一个版本：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0      # 自动构建并创建 Release
+```
+
+CLI 常用命令：
+
+```bash
+packrelay init-config --path config/packrelay/config.json
+packrelay scan    --config <cfg>                 # 只扫描+比对
+packrelay once    --config <cfg> [--dry-run] [--force] [--skip-release]
+packrelay watch   --config <cfg>                 # 常驻
+packrelay redirect --config <cfg>                # 只跑 302 服务
+packrelay package --input <dir> --output <zip> [--json]
+packrelay dump-state --config <cfg>
+```
+
+---
+
+## 10. LLBDS 测试环境搭建（本机实测步骤）
+
+官方 `www.minecraft.net` 在本机不可达（DNS 解析到 `23.217.205.12`，TCP 超时），
+故改为用 **lip 的 `github.com/LiteLDev/bds` 依赖**从 GitHub 取 BDS 本体：
+
+```bash
+# lip 0.34.7 已存在；BDS 作为 LeviLamina 的依赖被一并安装（约 436 MiB）
+cd <workspace>/llbds
+lip install github.com/LiteLDev/LeviLamina
+```
+
+安装结果（实际产物）：
+
+```
+llbds/
+├── bedrock_server_mod.exe     232 MiB  ← LeviLamina 打过补丁的服务端
+├── bedrock_server.exe.bak              ← 原版备份
+├── PreLoader.dll / PeEditor.exe / bdsdown.exe
+├── LeviLamina.dll (mods/LeviLamina)
+├── mods/ config/ resource_packs/ behavior_packs/ data/ definitions/
+└── tooth_lock.json            ← 依赖锁：bds 1.26.60 / LeviLamina 26.60.2
+```
+
+启动验证（`./bedrock_server_mod.exe`）：
+
+```
+INFO [PreLoader] Preloading: LeviLamina <LeviLamina.dll>
+INFO [PreLoader] LeviLamina Loaded.
+IFO [LeviLamina] 正在加载模组…… / 已加载 0 个模组
+IFO [Server] Version: 1.26.60.6(ProtocolVersion 2225) with LeviLamina-26.60.2
+IFO [Server] Server started in (3.2s)!
+```
+
+插件落位（`mods/packrelay/`），配置与状态：
+
+```
+llbds/mods/packrelay/{manifest.json, packrelay.mod.dll, config/config.json}
+llbds/.mcpack-sync/{state.json, cdn.json, repo/}
+llbds/cdn_config.json          ← 由 bdsCdnConfig sink 生成（扁平 map）
+llbds/logs/packrelay.log
+```
+
+> `config.json` 的实际路径是 `mods/packrelay/config/config.json`（`NativeMod::getConfigDir()`），
+> 相对路径（`resourceDir`、`.mcpack-sync/*`、`cdn_config.json`）全部以**服务器根目录**为基准。
+
+---
+
+## 11. 验证结果
+
+### 11.1 单元测试 —— 183/183
+
+覆盖 SHA-256 已知向量与分块一致性、JSON 往返/非法输入/键序保持、通配符（含 `**` 跨目录）、
+版本与 slug、镜像模板与选择策略（含 ghfast 前缀拼接与尾斜杠收敛）、配置默认值与校验、
+扫描/比对全矩阵（新增→未变→改内容→改版本→删除）、状态原子写往返、git 凭据解析与脱敏、
+BDS 侧 `packId -> url` 映射与幂等 upsert、`cdn_config.json` 扁平格式回归。
+
+```
+$ ./build/mcpsync-tests
+183 passed, 0 failed
+```
+
+### 11.2 端到端 —— 36/36（真实 git + 真实进程 + 模拟 Actions）
+
+`node scripts/e2e.mjs`：用真实 Kaleidoscope 资源包（1980 文件 / 19.1 MiB）跑完整链路，
+本地裸仓库充当 GitHub，`scripts/ci-release.sh` 由"CI watcher"在检测到新 commit 时并发执行。
+
+| 阶段 | 验证点 | 结果 |
+|---|---|---|
+| 首轮 | 扫描识别新增包、push 成功 | PASS |
+| | 仓库已预置 `release.yml` + `ci-release.sh` | PASS |
+| | `index.json` 含 uuid / 版本 / 预渲染 tag+asset | PASS |
+| | Actions 产出 release 元数据与 zip（CRC 校验通过，1980 条目） | PASS |
+| | `cdn.json` 指向最新资产 | PASS |
+| | `state.json` 指纹与索引一致、记录 commit | PASS |
+| 二轮 | 判定 `unchanged=1`，远端 HEAD 不变（**无重复提交**） | PASS |
+| 三轮 | 改 `pack_icon.png`（版本号不变）→ 判定 `updated=1` | PASS |
+| | 产生新 commit、新 tag、CDN 地址切换到新 release | PASS |
+| CDN | `redirect` 服务 `/health` 200、`/pack` 302 → Location=最新资产 | PASS |
+| | 跟随 302 实际下载到合法 zip（PK 头） | PASS |
+
+```
+36 passed, 0 failed
+```
+
+> 该脚本会先清空 `e2e/` 目录再重建，本轮回归时这一步被环境策略拦下，未重跑；
+> 上表是最近一次通过的实跑记录。本轮改动的 4 处都在单测与真实 BDS 运行里覆盖到了（见 11.3 / 11.4）。
+
+### 11.3 真实 BDS 消费 CDN 配置 —— `cdn_config.json` 是**扁平**的
+
+以插件生成的 `cdn_config.json` 启动 `bedrock_server_mod.exe`，对比三种输入：
+
+| `cdn_config.json` | BDS 日志 |
+|---|---|
+| 不存在 | `No CDN config file found at: cdn_config.json for dedicated server` |
+| 非法 JSON | `ERR [Server] Failed to parse CDN config` |
+| **插件生成** | **无任何 cdn 错误行**（被正常读取解析） |
+
+这只能证明文件进了 `CDNConfig::_readConfigFile` 的解析路径。它的**结构语义**是靠下面
+这条运行时证据反推出来的——启动后把 BDS 内存里的 `mPackCDNUrls` 打出来：
+
+```
+# 早期写法 {"CDN URL": "...", "packs": [{...}]}
+cdn: pushed 12 pack(s) into BDS CDNConfig, mPackCDNUrls now 14 entries
+cdn:   [CDN URL] -> http://127.0.0.1:19134/pack
+cdn:   [packs] ->                                   ← 数组被退化成空串
+cdn:   [0575c61f-a5da-4b7f-9961-ffda2908861e] -> https://ghfast.top/https://github.com/...
+```
+
+`("packs", "")` 这条凭空出现的记录说明：`_readConfigFile()` 把**顶层 JSON 对象的每个成员
+按 key→string 塞进 `vector<pair<string,string>>`，非字符串值填空串**——`packs` 数组根本不被识别。
+所以磁盘格式必须是扁平的：
+
+```json
+{
+  "CDN URL": "",
+  "0575c61f-a5da-4b7f-9961-ffda2908861e": "https://ghfast.top/https://github.com/o/r/releases/download/t/a.zip",
+  "0575c61f-a5da-4b7f-9961-ffda2908861e_1.26.60": "https://ghfast.top/https://github.com/o/r/releases/download/t/a.zip"
+}
+```
+
+改为扁平格式后重跑，垃圾条目消失：
+
+```
+cdn: pushed 12 pack(s) into BDS CDNConfig, mPackCDNUrls now 13 entries
+cdn:   [CDN URL] ->
+cdn:   [0575c61f-...] -> https://ghfast.top/https://github.com/...
+```
+
+13 = 12 个包 + 1 个遗留前缀键，干净。这条回归已固化为单元测试 `testBdsCdnConfigFile`
+（断言顶层没有 `packs`、没有任何数组值、两种主键都在且值为含加速前缀的完整地址）。
+
+### 11.4 mod 在真实 LLBDS 上加载并写入 BDS 内存
+
+`lip install github.com/LiteLDev/LeviLamina` 环境下，`bedrock_server_mod.exe` 实跑：
+
+```
+IFO [LeviLamina] 正在加载 packrelay v1.0.0
+IFO [packrelay] loading packrelay, server root = .
+IFO [packrelay] state loaded: 12 pack(s) from .\.mcpack-sync/state.json
+IFO [packrelay] cdn: restored 12 target(s), redirect -> https://ghfast.top/...
+IFO [packrelay] pipeline: watcher started, interval=0s
+IFO [packrelay] packrelay ready: resourceDir=.\resource_packs, git.enabled=false
+IFO [LeviLamina] 已加载 1 个模组
+IFO [packrelay] server ready: pushing cdn urls into BDS memory
+IFO [packrelay] cdn: pushed 12 pack(s) into BDS CDNConfig, mPackCDNUrls now 13 entries
+Quit correctly                      ← exit code 0，无崩溃、无 minidump
+```
+
+也就是说「改磁盘文件不生效、必须写 BDS 内存」这条要求已经真正打通：
+`getServerInstance()` → `ServerInstance::mCDNConfig.get().get()` → `CDNConfig::mPackCDNUrls`
+拿到的是**活对象**，写入即时生效，不需要重启。
+
+同时修掉了三个本轮定位到的缺陷：
+
+| 缺陷 | 后果 | 根因 |
+|---|---|---|
+| 关闭时崩溃 `0xC0000409` | 每次停服都生成 minidump、被崩溃上报 | `std::thread` 成员仍是 joinable 就进了静态析构 → `std::terminate` → `abort`。崩溃栈：`~McpackSyncMod → std::thread::~thread → ucrtbase(int 0x29)` |
+| 每 8 秒无条件重扫一次 | pack 多时持续吃 CPU | `scanIntervalSeconds: 0` 被 `std::max(5, ...)` 变成 5 秒周期扫描，再叠 3 秒扫描耗时 |
+| `cdn_config.json` 格式错误 | BDS 内存里多出 2 条垃圾键 | 见 11.3 |
+
+---
+
+## 12. 已知限制
+
+1. **mod 目标需 MSVC**：见 §9，MinGW 无法链接 LL 的 MSVC 修饰符号。core/CLI 全部可用 g++ 构建并已验证。
+2. **`cdn_config.json` 已确认是扁平 `map<string,string>`**（见 §11.3，靠运行时反推出的结论，
+   不是文档）。字段名本身不再是"猜测"，但 `"CDN URL"` 这个遗留前缀键的具体语义仍未确认——
+   我们只把它当占位保留，实际地址全部写在 `<uuid>` / `<uuid>_<version>` 键里。
+3. **写内存依赖 BDS 布局**：`ServerInstance::mCDNConfig` 是 public 成员（`ServerInstance.h` 第 191 行的
+   `public:` 段覆盖到第 235 行），`CDNConfig::mPackCDNUrls` 也是 public，因此可直接写入；
+   但这属于二进制布局依赖，**BDS 大版本升级后要用 `/relay dump` 复验一次**。
+   若哪天成员被收回私有，可退回"拼地址 + 写 `cdn_config.json` + 重启生效"的纯文件路线。
+4. **`mPackCDNUrls` 的主键格式仍未确认**：我们同时写 `<uuid>_<version>` 与裸 `<uuid>` 两种键；
+   键不匹配时不会崩溃，只是该包会退回服务端直传。用 `/relay dump` 可看到 BDS 实际持有的键。
+5. **控制台指令依赖加载器提供 `bedrock_runtime.dll`**（本机环境缺失，已自动降级）。
+   命令 API（`CommandOutput::success` / `CommandRegistry::parse` / `Bedrock::type_id`）的导入全部
+   由 `prelink` 生成的 `bedrock_runtime_api.lib` 指向 `bedrock_runtime.dll`，而该模块由加载器在运行时
+   以虚拟模块形式提供，**不是磁盘文件**（官方 LeviLamina 发布 zip 里只有 `LeviLamina.dll/pdb/manifest.json`）。
+   本机 `PreLoader.dll` 未暴露它，探测结果恒为 `err=126 ERROR_MOD_NOT_FOUND`，一旦调用就
+   `0xC06D007E` 把进程带走。因此插件在 `ServerReady` 时探测一次，缺失就整段跳过命令注册并明确告警；
+   **扫描 / git 推送 / release / 写 BDS 内存全部不受影响**（这几条路径走的是 `LeviLamina.dll` 导出符号
+   与头文件内联偏移，不经过 `bedrock_runtime.dll`）。
+   同等能力可用 CLI 完成：`packrelay git remote|token|test`、`packrelay scan|once`、`packrelay cdn render`。
+   在 `bedrock_runtime.dll` 正常提供的环境里，`/relaygit` `/relay push` 等指令会自动启用。
+6. 单进程单实例：`.mcpack-sync/` 目录未加文件锁，同一服务器根目录不要同时跑两个 `packrelay`。

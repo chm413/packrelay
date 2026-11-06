@@ -1,0 +1,167 @@
+name: build
+
+# 三块互相独立的构建：
+#   core  —— 跨平台引擎 + CLI + 单测（零第三方依赖，任何机器都能编）
+#   mod   —— Windows + MSVC 的 LeviLamina mod DLL（依赖 LL 生态，走 xmake 官方 levilamina 包）
+#   dist  —— 汇总上面两者的产物，打成可直接分发的 zip
+#
+# release.yml 通过 workflow_call 复用本文件，保证「发布的产物」和「CI 验证的产物」是同一套流程。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 引擎 + CLI + 单测
+  # ---------------------------------------------------------------------------
+  core:
+    name: core / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -C Release
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # VS 多配置生成器落在 build/Release/，单配置生成器落在 build/
+          for p in build/Release/packrelay.exe build/packrelay.exe build/packrelay; do
+            [ -f "$p" ] && cp "$p" out/ && echo "staged $p"
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # LeviLamina mod DLL
+  # ---------------------------------------------------------------------------
+  mod:
+    name: mod / windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          # levilamina / bedrockdata 会现场编译，产物很重；缓存后二次构建从 ~20min 降到 ~2min。
+          # 不设 XMAKE_ROOT（改动全局目录反而增加不确定性），把 xmake 几种默认位置都缓存上。
+          path: |
+            ~/.xmake
+            C:\Users\runneradmin\AppData\Local\.xmake
+            C:\Users\runneradmin\AppData\Roaming\.xmake
+          key: xmake-${{ runner.os }}-ll2660-${{ hashFiles('xmake.lua') }}
+          restore-keys: |
+            xmake-${{ runner.os }}-ll2660-
+
+      - name: Configure
+        run: |
+          xmake --version
+          xmake f -c -y -m release --target_type=server
+
+      - name: Build mod
+        run: xmake build -y -v packrelay
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          dll=$(find build -type f -name 'packrelay.dll' | head -1)
+          if [ -z "$dll" ]; then
+            echo "::error::packrelay.dll not found, build output tree:"
+            find build -maxdepth 4 -type f -name '*.dll' -o -name '*.lib' | head -40
+            exit 1
+          fi
+          echo "found $dll"
+          # manifest.json 的 entry 必须是 packrelay.mod.dll，这里按发布名落位
+          cp "$dll" out/packrelay.mod.dll
+          pdb=$(find build -type f -name 'packrelay.pdb' | head -1 || true)
+          [ -n "$pdb" ] && cp "$pdb" out/packrelay.pdb && echo "found $pdb"
+          cp src/mod/manifest.json out/manifest.json
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mod-windows-x64
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 汇总打包
+  # ---------------------------------------------------------------------------
+  dist:
+    name: dist
+    needs: [core, mod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -R artifacts
+
+          # 1) 服务端 mod：解压到 mods/packrelay/ 即可用
+          mkdir -p pkg/mod/packrelay
+          cp artifacts/mod-windows-x64/* pkg/mod/packrelay/
+          (cd pkg/mod && zip -r "$GITHUB_WORKSPACE/packrelay-mod-win-x64.zip" packrelay)
+
+          # 2) 独立 CLI（不装 mod 也能跑扫描/推送/渲染）
+          mkdir -p pkg/cli-win
+          cp artifacts/cli-windows-latest/* pkg/cli-win/
+          (cd pkg/cli-win && zip -r "$GITHUB_WORKSPACE/packrelay-cli-win-x64.zip" .)
+
+          mkdir -p pkg/cli-linux
+          cp artifacts/cli-ubuntu-latest/* pkg/cli-linux/
+          chmod +x pkg/cli-linux/packrelay || true
+          (cd pkg/cli-linux && zip -r "$GITHUB_WORKSPACE/packrelay-cli-linux-x64.zip" .)
+
+          # 3) 校验包内容，防止把空包发出去
+          for z in packrelay-mod-win-x64.zip packrelay-cli-win-x64.zip packrelay-cli-linux-x64.zip; do
+            echo "--- $z ---"
+            unzip -l "$z" | tail -8
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: packrelay-*.zip
+          if-no-files-found: error
+          retention-days: 30
