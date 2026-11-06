@@ -255,7 +255,23 @@ mcpsync::upsertPackCdnUrls(urls, entries);          // entries 来自 cdn.json �
 避免泄漏到 `.git/config` 与 reflog。参数按 CRT 引号规则拼装后直接 `CreateProcessW`，不经 shell，杜绝注入。
 
 **仓库预置**：`GitPublisher::prepare()` 首次运行时把 `release.yml` / `ci-release.sh` / `README.md`
-写入目标仓库并随包一起提交——"仓库预置 workflow"不依赖人工操作，且模板版本跟随插件版本。
+写入目标仓库并随包一起提交——"仓库预置 workflow"不依赖人工操作。
+
+模板写入是**按内容哈希幂等**的（哈希锁记在目标仓库 `.packrelay/templates.lock`，不需要人工维护模板版本号）：
+
+| 情况 | 行为 |
+|---|---|
+| 文件不存在 | 写入模板 |
+| 内容与模板一致 | 什么都不做（不产生空 diff） |
+| 文件哈希 == lock 记录的哈希 | 文件仍是插件写的 → 判定为**模板升级**，备份旧版后覆盖 |
+| 文件哈希 != lock 记录的哈希 | 判定为**本地改动**，保留并 warn（删掉文件即可恢复内置模板） |
+| 无 lock 但文件已存在 | 首次接管，**备份后覆盖**（保证 Actions 链路开箱可用） |
+
+备份落在 `.packrelay/backup/`（该目录自带 `.gitignore`，不会被 `git add -A` 提交）。
+
+**脏工作区自愈**：`prepare()` 的 `checkout -B <branch> origin/<branch>` 若因上一轮中断留下的
+未提交改动而失败，会先 `reset --hard origin/<branch>` 再重试——镜像仓库内容每轮都由扫描结果重建，
+硬对齐远端是安全且幂等的；否则这种残留会让后续每一次推送都卡死在同一处。
 
 **tag 单一事实源**：插件在写 `index.json` 前就渲染好 `tag` 与 `assetName` 并写入索引；
 Actions 端**不做任何命名推断**，直接读 `index.json`。插件取回 release 用的也是同一个 tag，两端永不漂移。

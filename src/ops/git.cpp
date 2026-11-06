@@ -115,11 +115,28 @@ Status GitPublisher::prepare() {
         args.insert(args.end(), {"fetch", "--prune", "origin", mCfg.branch});
         auto f = gitRun(fsu::toUtf8(mRepo), args, mCfg.timeoutMs);
         if (f && f.value().exitCode == 0) {
-            auto co = gitRun(fsu::toUtf8(mRepo), {"checkout", "-B", mCfg.branch, "origin/" + mCfg.branch}, 30000);
-            if (!co || co.value().exitCode != 0) {
+            auto target   = "origin/" + mCfg.branch;
+            bool onTarget = false;
+            auto co       = gitRun(fsu::toUtf8(mRepo), {"checkout", "-B", mCfg.branch, target}, 30000);
+            onTarget      = co && co.value().exitCode == 0;
+            if (!onTarget) {
+                // 上一轮中断（超时/崩溃）可能在镜像仓库里留下未提交改动，
+                // 此时 checkout 会以 "Your local changes would be overwritten" 失败。
+                // 镜像仓库内容每轮都由扫描结果重建，所以硬对齐远端是安全且幂等的。
+                logger().warn("git: checkout failed, hard resetting mirror repo to " + target + " and retrying");
+                auto rs = gitRun(fsu::toUtf8(mRepo), {"reset", "--hard", target}, 60000);
+                if (!rs || rs.value().exitCode != 0) {
+                    logger().warn("git: hard reset failed: " + (rs ? trim(rs.value().out) : rs.error().str()));
+                }
+                auto retry = gitRun(fsu::toUtf8(mRepo), {"checkout", "-B", mCfg.branch, target}, 30000);
+                onTarget   = retry && retry.value().exitCode == 0;
+            }
+            if (!onTarget) {
                 auto co2 = gitRun(fsu::toUtf8(mRepo), {"checkout", "-B", mCfg.branch}, 30000);
                 if (!co2 || co2.value().exitCode != 0) {
-                    return Error{ErrCode::Git, "git checkout failed", co2 ? co2.value().out : std::string()};
+                    return Error{
+                        ErrCode::Git, "git checkout failed", co2 ? trim(co2.value().out) : std::string()
+                    };
                 }
             }
         } else {

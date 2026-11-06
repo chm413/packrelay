@@ -6,12 +6,18 @@
 #include "mcpsync/repo_template.hpp"
 #include "mcpsync/fsutil.hpp"
 #include "mcpsync/logger.hpp"
+#include "mcpsync/sha256.hpp"
 
 #include <filesystem>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mcpsync {
 
 namespace {
+
+namespace fs = std::filesystem;
 
 char const* kWorkflow = R"MCPACKTEMPLATE(# mcpack-sync: 由插件自动生成，请勿手工修改（升级插件时会被覆盖）
 name: release-packs
@@ -183,24 +189,160 @@ char const* kRepoReadme = R"MCPACKTEMPLATE(# Resource pack releases
 4. 插件轮询 Release，取回资产地址并更新 CDN 重定向目标
 )MCPACKTEMPLATE";
 
+// 模板写入策略（按内容哈希，不依赖人工维护版本号）：
+//   .packrelay/templates.lock 记录「插件上次写进去的内容哈希」。
+//   - 文件不存在                -> 写入模板
+//   - 内容与模板一致            -> 什么都不做（不产生空 diff）
+//   - 文件哈希 == lock 里的哈希 -> 文件仍是插件写的，本次是模板升级 -> 备份后覆盖
+//   - 否则（哈希对不上/无 lock）-> 判定为本地改动 -> 保留并 warn
+//   - 无 lock 但文件已存在      -> 首次接管：备份后覆盖（保证 Actions 链路开箱可用）
+char const* kLockRel      = ".packrelay/templates.lock";
+char const* kBackupDirRel = ".packrelay/backup";
+
+std::string contentHash(std::string_view data) {
+    return Sha256::hex(data);
+}
+
+struct TemplateLock {
+    std::vector<std::pair<std::string, std::string>> entries;
+
+    std::string find(std::string const& key) const {
+        for (auto const& [k, v] : entries) {
+            if (k == key) return v;
+        }
+        return {};
+    }
+    void set(std::string key, std::string value) {
+        for (auto& [k, v] : entries) {
+            if (k == key) {
+                v = std::move(value);
+                return;
+            }
+        }
+        entries.emplace_back(std::move(key), std::move(value));
+    }
+};
+
+TemplateLock readLock(fs::path const& p) {
+    TemplateLock lock;
+    std::string  text;
+    if (!fsu::exists(p) || !fsu::readFile(p, text)) return lock;
+
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t end  = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        auto line = text.substr(pos, end - pos);
+        auto eq   = line.find('=');
+        if (eq != std::string::npos && eq > 0) {
+            lock.entries.emplace_back(line.substr(0, eq), line.substr(eq + 1));
+        }
+        pos = end + 1;
+    }
+    return lock;
+}
+
+std::string renderLock(TemplateLock const& lock) {
+    std::string out;
+    for (auto const& [k, v] : lock.entries) {
+        out += k;
+        out += '=';
+        out += v;
+        out += '\n';
+    }
+    return out;
+}
+
+// 落地单个模板文件，返回 true 表示本次写入了新内容
+Result<bool> applyTemplate(
+    fs::path const&   path,
+    std::string_view  content,
+    std::string_view  label,
+    TemplateLock&     lock,
+    fs::path const&   backupDir
+) {
+    std::string const wantHash = contentHash(content);
+
+    if (!fsu::exists(path)) {
+        auto st = fsu::writeFileAtomic(path, content);
+        if (!st) return st.error();
+        lock.set(std::string(label), wantHash);
+        return true;
+    }
+
+    std::string existing;
+    auto        rd = fsu::readFile(path, existing);
+    if (!rd) return rd.error();
+    if (existing == content) {
+        lock.set(std::string(label), wantHash);
+        return false; // 已是当前模板，零改动
+    }
+
+    bool const knownTemplate = !lock.find(std::string(label)).empty();
+    bool const untouched     = lock.find(std::string(label)) == contentHash(existing);
+
+    if (knownTemplate && !untouched) {
+        // 上次写入后文件被改过：视为用户自己的定制，绝不覆盖
+        logger().warn(
+            "repo templates: " + std::string(label) +
+            " was modified locally and is kept as-is (delete the file to restore the built-in template)"
+        );
+        return false;
+    }
+
+    // 备份到 .packrelay/backup/（该目录自带 .gitignore），避免旧模板被 git add -A 提交
+    auto bak = backupDir / (path.filename().string() + ".bak");
+    auto st  = fsu::writeFileAtomic(bak, existing);
+    if (!st) return st.error();
+    logger().info(
+        std::string(knownTemplate ? "repo templates: upgraded " : "repo templates: adopted ") + std::string(label) +
+        " (previous copy saved to " + std::string(kBackupDirRel) + "/" + path.filename().string() + ".bak)"
+    );
+    st = fsu::writeFileAtomic(path, content);
+    if (!st) return st.error();
+    lock.set(std::string(label), wantHash);
+    return true;
+}
+
 } // namespace
 
 Status ensureRepoTemplates(std::filesystem::path const& repoRoot) {
     auto workflowPath = repoRoot / ".github" / "workflows" / "release.yml";
     auto scriptPath   = repoRoot / "scripts" / "ci-release.sh";
     auto readmePath   = repoRoot / "README.md";
+    auto lockPath     = repoRoot / fsu::fromUtf8(kLockRel);
+    auto backupDir    = repoRoot / fsu::fromUtf8(kBackupDirRel);
 
     auto st = fsu::ensureDir(workflowPath.parent_path());
     if (!st) return st;
     st = fsu::ensureDir(scriptPath.parent_path());
     if (!st) return st;
-
-    fsu::writeFileAtomic(workflowPath, kWorkflow);
-    fsu::writeFileAtomic(scriptPath, kReleaseScript);
-    if (!fsu::exists(readmePath)) {
-        fsu::writeFileAtomic(readmePath, kRepoReadme);
+    st = fsu::ensureDir(backupDir);
+    if (!st) return st;
+    // 备份目录不进仓库：否则升级留下的旧模板会被 git add -A 一起提交
+    auto ignorePath = backupDir / ".gitignore";
+    if (!fsu::exists(ignorePath)) {
+        st = fsu::writeFileAtomic(ignorePath, "*\n");
+        if (!st) return st;
     }
-    logger().debug("repo templates written to " + fsu::toUtf8(repoRoot));
+
+    auto lock = readLock(lockPath);
+
+    auto wf = applyTemplate(workflowPath, kWorkflow, "workflow", lock, backupDir);
+    if (!wf) return wf.error();
+    auto sc = applyTemplate(scriptPath, kReleaseScript, "script", lock, backupDir);
+    if (!sc) return sc.error();
+
+    if (!fsu::exists(readmePath)) {
+        auto rd = fsu::writeFileAtomic(readmePath, kRepoReadme);
+        if (!rd) return rd;
+    }
+
+    // 记录本次落地的哈希；下次运行据此区分「插件升级」与「本地改动」
+    st = fsu::writeFileAtomic(lockPath, renderLock(lock));
+    if (!st) return st;
+
+    logger().debug("repo templates ensured at " + fsu::toUtf8(repoRoot));
     return {};
 }
 

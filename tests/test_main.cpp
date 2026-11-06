@@ -8,6 +8,7 @@
 #include "mcpsync/json.hpp"
 #include "mcpsync/mirror.hpp"
 #include "mcpsync/model.hpp"
+#include "mcpsync/repo_template.hpp"
 #include "mcpsync/scanner.hpp"
 #include "mcpsync/sha256.hpp"
 #include "mcpsync/state.hpp"
@@ -627,6 +628,83 @@ void testGitAuth() {
     fsu::removeAll(dir);
 }
 
+void testRepoTemplates() {
+    namespace fs = std::filesystem;
+    auto root = fs::temp_directory_path() / ("mcpsync-tpl-" + std::to_string(fsu::nowUnix()));
+    fsu::removeAll(root);
+    CHECK(static_cast<bool>(fsu::ensureDir(root)));
+
+    auto wf     = root / ".github" / "workflows" / "release.yml";
+    auto script = root / "scripts" / "ci-release.sh";
+    auto readme = root / "README.md";
+    auto marker = root / ".packrelay" / "templates.lock";
+
+    // 首次落盘：三个文件都在，且 marker 记录了当前版本
+    auto st = ensureRepoTemplates(root);
+    CHECK(static_cast<bool>(st));
+    CHECK(fsu::exists(wf));
+    CHECK(fsu::exists(script));
+    CHECK(fsu::exists(readme));
+    CHECK(fsu::exists(marker));
+
+    std::string original;
+    CHECK(static_cast<bool>(fsu::readFile(script, original)));
+    CHECK(original.find("ci-release.sh") != std::string::npos);
+
+    // 用户改了脚本：同版本下必须保留，并留下可诊断的痕迹（不写 .bak）
+    std::string mine = "#!/usr/bin/env bash\n# my own release pipeline\n";
+    CHECK(static_cast<bool>(fsu::writeFileAtomic(script, mine)));
+    st = ensureRepoTemplates(root);
+    CHECK(static_cast<bool>(st));
+    std::string after;
+    CHECK(static_cast<bool>(fsu::readFile(script, after)));
+    CHECK_EQ(after, mine);
+    auto bakPath = root / ".packrelay" / "backup" / "ci-release.sh.bak";
+    CHECK(!fsu::exists(bakPath));
+
+    // 文件内容与模板一致时不应产生任何写操作（幂等，避免无意义 diff）
+    CHECK(static_cast<bool>(fsu::writeFileAtomic(script, original)));
+    st = ensureRepoTemplates(root);
+    CHECK(static_cast<bool>(st));
+    std::string same;
+    CHECK(static_cast<bool>(fsu::readFile(script, same)));
+    CHECK_EQ(same, original);
+
+    // marker 缺失（插件首次接管一个已有仓库）：旧文件先备份为 .bak，再写入内置模板
+    fsu::removeAll(marker);
+    std::string legacy = "#!/usr/bin/env bash\n# legacy hand-written script\n";
+    CHECK(static_cast<bool>(fsu::writeFileAtomic(script, legacy)));
+    st = ensureRepoTemplates(root);
+    CHECK(static_cast<bool>(st));
+    std::string restored;
+    CHECK(static_cast<bool>(fsu::readFile(script, restored)));
+    CHECK_EQ(restored, original);
+    std::string backup;
+    CHECK(static_cast<bool>(fsu::readFile(bakPath, backup)));
+    CHECK_EQ(backup, legacy);
+
+    // 插件升级：lock 记录的哈希与磁盘内容一致 => 文件仍是插件写的，可安全覆盖并备份旧版
+    std::string oldTemplate = "#!/usr/bin/env bash\n# built-in template v1\n";
+    CHECK(static_cast<bool>(fsu::writeFileAtomic(script, oldTemplate)));
+    CHECK(static_cast<bool>(fsu::writeFileAtomic(
+        marker,
+        "script=" + Sha256::hex(oldTemplate) + "\n"
+    )));
+    st = ensureRepoTemplates(root);
+    CHECK(static_cast<bool>(st));
+    std::string upgraded;
+    CHECK(static_cast<bool>(fsu::readFile(script, upgraded)));
+    CHECK_EQ(upgraded, original);
+    std::string backup2;
+    CHECK(static_cast<bool>(fsu::readFile(bakPath, backup2)));
+    CHECK_EQ(backup2, oldTemplate);
+
+    // 备份目录自带 .gitignore：旧模板不会被 git add -A 提交进分发仓库
+    CHECK(fsu::exists(root / ".packrelay" / "backup" / ".gitignore"));
+
+    fsu::removeAll(root);
+}
+
 } // namespace
 
 int main() {
@@ -645,6 +723,7 @@ int main() {
     testConfig();
     testScannerAndDiff();
     testStateAtomic();
+    testRepoTemplates();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
