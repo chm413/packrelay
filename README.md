@@ -479,6 +479,21 @@ xmake build -y packrelay
 | `.github/workflows/build.yml` | push 到 main、PR、手动 | 三块并行：`core`（Windows+Linux 编译 CLI 与单测并 ctest）、`mod`（Windows+MSVC 编 DLL）、`dist`（汇总打 zip） |
 | `.github/workflows/release.yml` | 打 `v*` tag、手动指定 tag | `workflow_call` 调 build.yml → 下载 dist 产物 → `gh release create` |
 
+发版就是打 tag：
+
+```bash
+git tag -a v1.0.0 -m "packrelay v1.0.0"
+git push origin v1.0.0
+```
+
+`v1.0.0` 实测产物：
+
+| 资产 | 内容 |
+|---|---|
+| `packrelay-v1.0.0-mod-win-x64.zip` | `packrelay/{manifest.json, packrelay.mod.dll, packrelay.pdb}`，解压到 `mods/` 即用 |
+| `packrelay-v1.0.0-cli-win-x64.zip` | `packrelay.exe` |
+| `packrelay-v1.0.0-cli-linux-x64.zip` | `packrelay`（Linux 版可扫描/比对/打包/渲染；HTTP 只在 Windows 实现，故发布阶段需配 `release.waitForRelease=false` 走 URL 规则推导，`redirect` 不可用） |
+
 **产物结构**（三个 zip）：
 
 ```
