@@ -86,11 +86,16 @@ jobs:
             xmake-${{ runner.os }}-ll2660-
 
       - name: Configure
+        shell: pwsh
         run: |
           xmake --version
-          # 必须显式指定 msvc：runner 上 clang 也在 PATH 里，xmake 自动探测可能挑 clang，
-          # 而 LeviLamina 是 MSVC-only 的（源码用了 MSVC 扩展，导出也是 MSVC 修饰名），
-          # 用 clang 编译会在一开始就大量报错。
+          # LeviLamina 是 MSVC-only 的：源码用了 MSVC 扩展，导出也是 MSVC 修饰名。
+          # runner 上 LLVM/clang 就在 PATH 里，xmake 在「包安装」阶段（现场编译 LL）会自己重新探测
+          # 工具链，--toolchain=msvc 管不到这一层，结果用 clang-cl 配 MSVC 的 STL 头编译，
+          # 直接炸在 incomplete type。所以这里把 clang 从 PATH 剔除，只留 MSVC，双保险。
+          $clean = ($env:PATH -split ';' | Where-Object { $_ -and $_ -notmatch '(?i)\\llvm\\|\\clang' }) -join ';'
+          "PATH=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8NoBOM
+          $env:PATH = $clean
           xmake f -c -y -m release --target_type=server --toolchain=msvc
 
       - name: Dump xmake install logs
