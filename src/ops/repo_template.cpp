@@ -117,25 +117,30 @@ for slug in $changed; do
   mkdir -p "$OUT_DIR/$tag"
   rm -f "$zip_path"
 
+  # 下面要 cd 进包目录打包，相对路径 $zip_path 会解析到包目录下面去（实测踩坑：
+  # "./.releases/<tag>/<asset>.zip" 在 cd 后变成 packs/<slug>/.releases/...，zip 直接
+  # "Could not create output file"）。先把输出路径转成绝对路径再进子 shell。
+  zip_abs="$(cd "$(dirname "$zip_path")" && pwd)/$(basename "$zip_path")"
+
   # 优先系统 zip；否则用 mcpack-sync 自带的 store 打包器；最后退回 tar
   if command -v zip >/dev/null 2>&1; then
-    ( cd "packs/$slug" && zip -qr "$zip_path" . )
+    ( cd "packs/$slug" && zip -qr "$zip_abs" . )
   elif command -v mcpsync >/dev/null 2>&1; then
-    mcpsync package --input "packs/$slug" --output "$zip_path" >/dev/null
+    mcpsync package --input "packs/$slug" --output "$zip_abs" >/dev/null
   else
-    ( cd "packs/$slug" && tar --force-local -a -c -f "$zip_path" . )
+    ( cd "packs/$slug" && tar --force-local -a -c -f "$zip_abs" . )
   fi
 
-  size="$(wc -c < "$zip_path" | tr -d ' ')"
-  sha="$(sha256sum "$zip_path" | cut -d' ' -f1)"
+  size="$(wc -c < "$zip_abs" | tr -d ' ')"
+  sha="$(sha256sum "$zip_abs" | cut -d' ' -f1)"
   echo "packaged $slug -> $zip_path (${size} bytes, sha256=$sha)"
 
   if [ "$MODE" = "--gh" ]; then
     if gh release view "$tag" >/dev/null 2>&1; then
       echo "::notice::release $tag already exists, uploading asset if missing"
-      gh release upload "$tag" "$zip_path" --clobber
+      gh release upload "$tag" "$zip_abs" --clobber
     else
-      gh release create "$tag" "$zip_path" \
+      gh release create "$tag" "$zip_abs" \
         --title "$tag" \
         --notes "Automated release for \`$slug\` by mcpack-sync." \
         --latest
