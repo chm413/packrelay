@@ -13,6 +13,12 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      tag:
+        description: "发布 tag（如 v1.0.1）；用来把版本号写进 mod 的 manifest.json"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -138,6 +144,18 @@ jobs:
           pdb=$(find build -type f -name 'packrelay.pdb' | head -1 || true)
           [ -n "$pdb" ] && cp "$pdb" out/packrelay.pdb && echo "found $pdb"
           cp src/mod/manifest.json out/manifest.json
+          # manifest 的 version 必须跟发布 tag 走。写死 1.0.0 的话，装上去
+          # LeviLamina 永远显示 v1.0.0，用户没法从日志判断装的是哪个版本。
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [ -n "$tag" ]; then
+            ver="${tag#v}"
+            sed -i "s/\"version\": *\"[^\"]*\"/\"version\": \"${ver}\"/" out/manifest.json
+            echo "manifest version -> ${ver} (from ${tag})"
+          fi
+          grep -m1 '"version"' out/manifest.json
           ls -l out
 
       - uses: actions/upload-artifact@v4

@@ -19,6 +19,9 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    # 把 tag 传下去，mod 的 manifest.json 才会写上正确版本
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
 
   publish:
     name: publish
