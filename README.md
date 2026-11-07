@@ -503,6 +503,11 @@ packrelay-<tag>-cli-win-x64.zip     packrelay.exe
 packrelay-<tag>-cli-linux-x64.zip   packrelay
 ```
 
+`manifest.json` 的 `version` **由 CI 从 tag 注入**（`build.yml` 的可选输入 `tag`，
+`release.yml` 传下来；直接推 tag 时回退到 `GITHUB_REF_NAME`）。写死成固定值的话，
+装到服务器上 LeviLamina 会永远显示同一个版本号——`v1.0.1` 之前就是这样，日志里
+`正在加载 packrelay v1.0.0` 与 tag 对不上。改完在真机上验过：`正在加载 packrelay v1.0.1`。
+
 **两条构建路径为什么不同**：
 
 - `core` 用 **CMake**：零第三方依赖，Windows / Linux 都能编，跑 ctest。
